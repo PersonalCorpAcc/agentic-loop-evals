@@ -2,11 +2,27 @@
 // own soak values are written -- `5m`, `2h`, `1d` -- and a way back again. Enough for a change
 // to be a real one-line edit on a real file, promoted through three branches.
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+const DESCENDING_UNITS = Object.keys(UNITS).reverse();
 
+// Compound durations (`1h30m`) are a run of unit segments, each unit used at most once and
+// written largest-first; `rank` tracks that ordering and `consumed` that the segments tile
+// the whole input with no gaps, so stray characters or repeats refuse like anything else.
 export function parse(value) {
-  const match = /^([1-9]\d*)([smhdw])$/.exec(String(value ?? "").trim());
-  if (match === null) return null;
-  return Number(match[1]) * UNITS[match[2]];
+  const input = String(value ?? "").trim();
+  const segment = /([1-9]\d*)([smhdw])/g;
+  let match;
+  let consumed = 0;
+  let lastRank = -1;
+  let total = 0;
+  while ((match = segment.exec(input)) !== null) {
+    if (match.index !== consumed) return null;
+    const rank = DESCENDING_UNITS.indexOf(match[2]);
+    if (rank <= lastRank) return null;
+    lastRank = rank;
+    total += Number(match[1]) * UNITS[match[2]];
+    consumed = segment.lastIndex;
+  }
+  return consumed > 0 && consumed === input.length ? total : null;
 }
 
 // The largest unit that divides the value exactly, so `format(parse(x))` gives back `x` for
