@@ -12,9 +12,10 @@ export function parse(value) {
 // The largest unit that divides the value exactly, so `format(parse(x))` gives back `x` for
 // anything `parse` accepts.
 export function format(milliseconds) {
-  if (!Number.isInteger(milliseconds) || milliseconds <= 0) {
+  if (!Number.isInteger(milliseconds) || milliseconds < 0) {
     throw new Error(`not a positive whole number of milliseconds: ${JSON.stringify(milliseconds)}`);
   }
+  if (milliseconds === 0) return "0s";
   for (const [unit, size] of Object.entries(UNITS).reverse()) {
     if (milliseconds % size === 0) return `${milliseconds / size}${unit}`;
   }
