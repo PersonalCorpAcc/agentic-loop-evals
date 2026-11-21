@@ -4,9 +4,9 @@
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
 export function parse(value) {
-  const match = /^([1-9]\d*)([smhdw])$/.exec(String(value ?? "").trim());
+  const match = /^([1-9]\d*)([smhdwSMHDW])$/.exec(String(value ?? "").trim());
   if (match === null) return null;
-  return Number(match[1]) * UNITS[match[2]];
+  return Number(match[1]) * UNITS[match[2].toLowerCase()];
 }
 
 // The largest unit that divides the value exactly, so `format(parse(x))` gives back `x` for
