@@ -3,10 +3,17 @@
 // to be a real one-line edit on a real file, promoted through three branches.
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
+// One optional `<count>` group per unit, largest first -- order and uniqueness both fall
+// straight out of the regex shape, so there's no separate bookkeeping to keep in sync.
+const COMPOUND = /^(?:([1-9]\d*)w)?(?:([1-9]\d*)d)?(?:([1-9]\d*)h)?(?:([1-9]\d*)m)?(?:([1-9]\d*)s)?$/;
+
 export function parse(value) {
-  const match = /^([1-9]\d*)([smhdw])$/.exec(String(value ?? "").trim());
+  const match = COMPOUND.exec(String(value ?? "").trim());
   if (match === null) return null;
-  return Number(match[1]) * UNITS[match[2]];
+  const groups = match.slice(1);
+  if (groups.every((group) => group === undefined)) return null;
+  const sizes = Object.values(UNITS).reverse();
+  return groups.reduce((total, group, index) => total + (group === undefined ? 0 : Number(group) * sizes[index]), 0);
 }
 
 // The largest unit that divides the value exactly, so `format(parse(x))` gives back `x` for
