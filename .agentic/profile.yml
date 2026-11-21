@@ -1,0 +1,53 @@
+# The eval repository's profile (feature 007 X16): the chain canary's app and engine, on trunk,
+# with nothing merged unattended -- an eval's pull requests stay open for a person to read.
+version: 1
+name: loop-evals
+runners:
+  agent: [ubuntu-24.04]
+  slim: [ubuntu-24.04]
+  ci: [ubuntu-24.04]
+llm:
+  engine: claude
+  model: claude-sonnet-5
+  secret: ANTHROPIC_API_KEY
+bot:
+  appLogin: personalcorpacc-agentic-loop[bot]
+  gitIdentity: personalcorpacc-agentic-loop[bot]
+  appIdSecret: BOT_APP_ID
+  keySecret: BOT_PRIVATE_KEY
+memory:
+  enabled: false
+codegraph:
+  enabled: false
+stack: [node-pnpm]
+projects:
+  - path: .
+    stack: node-pnpm
+    label: app
+    install: pnpm install --frozen-lockfile
+    build: pnpm run build
+    test: pnpm run test
+branching:
+  strategy: trunk
+  cutFrom: main
+  mergeMethod: squash
+  branchNaming: agent/{issue}-{run}
+  autoMerge:
+    mode: off
+    targets: []
+ci:
+  template: app-ci-node-app
+  workflowName: CI
+release:
+  versionSource: git-tag
+audit:
+  cronSlot: 3
+crons:
+  audit: off
+  auditClose: off
+  cleanupArtifacts: off
+  # Approves the bot's held CI runs; without it an eval pull request never gets CI.
+  reconcileBotPrRuns: "23 * * * *"
+constitution:
+  entry: AGENTS.md
+  docs: [ARCHITECTURE.md]

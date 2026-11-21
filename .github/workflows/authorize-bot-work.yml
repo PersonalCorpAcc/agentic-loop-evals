@@ -1,0 +1,112 @@
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/authorize-bot-work.yml. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Human adds a work label → validates permission → bot adds the working label
+# This ensures the bot is the actor for all agentic workflows.
+#
+# IMPORTANT: Only triggers for HUMAN actors. When the bot transitions refine→implement,
+# it adds the working label itself, so authorize-bot-work must not fire again.
+name: "Authorize Bot Work"
+
+run-name: "Authorizing: ${{ github.event.issue.title }} (#${{ github.event.issue.number }})"
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  # A work label on a closed issue starts nothing: the router does not work on closed issues.
+  # Authorising it anyway left the working label on loopscope #162 for four hours with nothing
+  # running (21/11/2026). Say so instead, once, to the person who labelled it. The plain
+  # workflow token raises no event, so the comment cannot start a run of its own.
+  closed-issue:
+    if: >
+      (github.event.label.name == 'implement' ||
+       github.event.label.name == 'refine') &&
+      github.event.issue.state == 'closed' &&
+      !endsWith(github.actor, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Say that a closed issue starts nothing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          LABEL: ${{ github.event.label.name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "@${ACTOR} this issue is closed, so the \`${LABEL}\` label starts nothing. Reopen the issue, then add the label again."
+          echo "::notice::#$ISSUE_NUMBER is closed; ${LABEL} starts nothing until it is reopened."
+
+  authorize:
+    # Only trigger for work labels from HUMANS (not bots),
+    # and only if neither another bot run nor human review currently owns the issue.
+    if: >
+      (github.event.label.name == 'implement' ||
+       github.event.label.name == 'refine') &&
+      !contains(github.event.issue.labels.*.name, 'bot-working') &&
+      !contains(github.event.issue.labels.*.name, 'review') &&
+      !endsWith(github.actor, '[bot]') &&
+      github.event.issue.state == 'open'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: authorize-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check actor permission
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" \
+            --jq '.permission' 2>/dev/null || echo "none")
+          
+          case "$permission" in
+            admin | maintain | write)
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::$ACTOR has $permission permission - authorized"
+              ;;
+            *)
+              echo "authorized=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::$ACTOR has '$permission' permission - not authorized"
+              ;;
+          esac
+
+      - name: Checkout for App token action
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate App token
+        if: steps.check.outputs.authorized == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: Bot adds the working label
+        if: steps.check.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          
+          echo "Adding the bot-working label to issue #$ISSUE_NUMBER (triggered by $LABEL)"
+          gh issue edit "$ISSUE_NUMBER" --add-label "bot-working"
+          
+          echo "::notice::the bot-working label added - bot will now own the $LABEL workflow"
