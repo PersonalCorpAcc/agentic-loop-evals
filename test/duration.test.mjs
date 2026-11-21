@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { format, parse } from "../src/duration.mjs";
 
 test("parses each unit", () => {
+  assert.equal(parse("250ms"), 250);
   assert.equal(parse("30s"), 30_000);
   assert.equal(parse("5m"), 300_000);
   assert.equal(parse("2h"), 7_200_000);
@@ -25,11 +26,16 @@ test("formats in the largest unit that divides exactly", () => {
   assert.equal(format(1_209_600_000), "2w");
 });
 
+test("formats sub-second values in milliseconds", () => {
+  assert.equal(format(1500), "1500ms");
+  assert.equal(format(1000), "1s");
+});
+
 test("prefers weeks over days when a value divides exactly", () => {
   assert.equal(format(parse("14d")), "2w");
   assert.equal(format(parse("10d")), "10d");
 });
 
 test("round-trips everything it parses", () => {
-  for (const value of ["45s", "5m", "90m", "2h", "3d", "2w"]) assert.equal(format(parse(value)), value);
+  for (const value of ["250ms", "45s", "5m", "90m", "2h", "3d", "2w"]) assert.equal(format(parse(value)), value);
 });
