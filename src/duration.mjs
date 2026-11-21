@@ -20,3 +20,15 @@ export function format(milliseconds) {
   }
   throw new Error(`not a whole number of seconds: ${milliseconds}`);
 }
+
+// The sum of any number of durations `parse` accepts, formatted the way `format` would.
+export function add(...values) {
+  if (values.length === 0) return null;
+  let total = 0;
+  for (const value of values) {
+    const milliseconds = parse(value);
+    if (milliseconds === null) return null;
+    total += milliseconds;
+  }
+  return format(total);
+}
