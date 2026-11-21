@@ -9,6 +9,18 @@ export function parse(value) {
   return Number(match[1]) * UNITS[match[2]];
 }
 
+// Sums durations written the way `parse` accepts them, formatted the way `format` would.
+export function add(...values) {
+  if (values.length === 0) return null;
+  let total = 0;
+  for (const value of values) {
+    const milliseconds = parse(value);
+    if (milliseconds === null) return null;
+    total += milliseconds;
+  }
+  return format(total);
+}
+
 // The largest unit that divides the value exactly, so `format(parse(x))` gives back `x` for
 // anything `parse` accepts.
 export function format(milliseconds) {

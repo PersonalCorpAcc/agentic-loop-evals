@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { format, parse } from "../src/duration.mjs";
+import { add, format, parse } from "../src/duration.mjs";
 
 test("parses each unit", () => {
   assert.equal(parse("30s"), 30_000);
@@ -32,4 +32,16 @@ test("prefers weeks over days when a value divides exactly", () => {
 
 test("round-trips everything it parses", () => {
   for (const value of ["45s", "5m", "90m", "2h", "3d", "2w"]) assert.equal(format(parse(value)), value);
+});
+
+test("sums durations across units", () => {
+  assert.equal(add("1h", "30m"), "90m");
+  assert.equal(add("1d", "1d"), "2d");
+  assert.equal(add("30s"), "30s");
+});
+
+test("refuses invalid or missing input", () => {
+  assert.equal(add("1h", "nope"), null);
+  assert.equal(add("1h", "0m"), null);
+  assert.equal(add(), null);
 });
