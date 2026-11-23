@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-triage.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-triage.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   REPO_RULES: "Install with the lockfile frozen; an install that resolves a different tree is not reproducing the change under review. Run scripts through pnpm rather than npx, or a second package manager's lockfile appears in the diff."
   TRIAGE_LABEL: triage
@@ -34,8 +34,11 @@ description: |
 name: "Agent: Triage Issue"
 
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -66,6 +69,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # GITHUB_TOKEN on purpose. A label applied by the app raises a labeled event, and the
       # classifier routes bot-working straight back into this same worker: the second run
       # queues behind this one and then executes, doing the work twice. Nothing needs to see
@@ -138,6 +148,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Apply agent output
         uses: ./.github/actions/apply-agent-output
         with:
@@ -211,7 +228,7 @@ jobs:
           subject: ${{ format('#{0}', inputs.issue-number) }}
           detail: "${{ job.status == 'success' && 'The issue was triaged and its labels moved on.' || 'The triage conclusion did not finish; the step log says where it stopped.' }}"
   incomplete:
-    needs: [agent, safe_outputs, validate_output]
+    needs: [activation, agent, safe_outputs, validate_output]
     if: >
       always() &&
       (
@@ -232,6 +249,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Release the issue
         uses: ./.github/actions/remove-issue-labels
         with:
@@ -252,6 +276,7 @@ jobs:
           body: |
             ${{ env.TRIAGE_MARKER }}
             ${{ env.INCOMPLETE_COMMENT }}
+            ${{ needs.activation.outputs.daily_ai_credits_exceeded == 'true' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it). Work resumes once the day''s usage is back under it; raise the variable to allow more.', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || '' }}
             [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 if: inputs.issue-number != ''
@@ -260,14 +285,26 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
+  id: opencode
+  version: "2.0.26"
   # The agent job's own concurrency group, per issue. The compiler's default is one group per
   # workflow, which serialised this worker across the whole repository whatever the router
   # allowed; the router's caller job owns the real limit (review WF-06).
   concurrency:
     group: "gh-aw-triage-${{ inputs.issue-number }}"
     cancel-in-progress: false
-model: claude-sonnet-5
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+  args:
+    # OpenCode's command line. The engines that take their model from the `model:` key above
+    # need no arguments, and this block goes with them (FR-076).
+    - "--model"
+    - "anthropic-compat/claude-sonnet-5"
+
+model: openai/claude-sonnet-5
 max-turns: 300
 max-turn-cache-misses: 3000
 max-ai-credits: 5000
@@ -290,6 +327,8 @@ steps:
       repo: ${{ github.repository }}
       output-path: ${{ env.OPEN_ISSUES_PATH }}
 
+# Each run's OpenTelemetry GenAI spans -- duration, tokens, model, outcome; never prompt or
+# response content -- go to the profile's OTLP endpoint (feature 007 X14, FR-074).
 safe-outputs:
   # A failed run is already a red run. An issue per failure buries the real backlog
   # under noise nobody closes.

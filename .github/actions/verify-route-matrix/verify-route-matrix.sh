@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/verify-route-matrix/verify-route-matrix.sh. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/verify-route-matrix/verify-route-matrix.sh. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 # Exercise the router's real classifier. This sources classify-route.sh rather than
 # restating it, so a change to the route table cannot pass here by being copied twice.
 #
@@ -152,8 +152,23 @@ assert "merge-gate carries the failing CI conclusion" failure \
 assert "merge-gate carries the failing CI run id" 99 \
   "$(route_field ci-run-id EVENT=workflow_run RUN_PR_NUMBER=7 \
     RUN_CONCLUSION=failure RUN_ID=99)"
-assert_route "a green App CI run does not auto-trigger the gate" none \
-  EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=success RUN_ID=99
+# Shadow mode (feature 007 X11, FR-027): a green run on a person's pull request reaches the gate
+# too, for that person's pull request only. Off, a green run routes nowhere, as before.
+if [ "${SHADOW_HUMAN_PULL_REQUESTS:-false}" = "true" ]; then
+  assert_route "in shadow mode a green CI run on a pull request routes to the gate" merge-gate \
+    EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=success RUN_ID=99
+  assert "the shadow route is for a person's pull request only" true \
+    "$(route_field human-only EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=success RUN_ID=99)"
+  assert "the shadow route carries the green conclusion" success \
+    "$(route_field ci-conclusion EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=success RUN_ID=99)"
+  assert_route "in shadow mode a green CI run with no pull request routes nowhere" none \
+    EVENT=workflow_run RUN_PR_NUMBER= RUN_CONCLUSION=success RUN_ID=99
+else
+  assert_route "a green App CI run does not auto-trigger the gate" none \
+    EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=success RUN_ID=99
+fi
+assert "a failed CI run is gated whoever opened the pull request, not for people only" false \
+  "$(route_field human-only EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=failure RUN_ID=99)"
 assert_route "a cancelled App CI run does not auto-trigger the gate" none \
   EVENT=workflow_run RUN_PR_NUMBER=7 RUN_CONCLUSION=cancelled RUN_ID=99
 assert_route "a failed CI run with no pull request routes nowhere" none \
@@ -307,8 +322,11 @@ else
       { GATE_POLICY_OK=0; echo "FAIL: the merge-gate validator does not accept an approve verdict, so a gate that may not merge has no verdict to give" >&2; }
     # Step 4b resolves a conflict on green CI and says `remediated`. If the validator cannot
     # see the conflict, it throws that fix away on the default merge-target path (WF-04).
-    grep -q 'has_conflicts=' "$VALIDATOR_SH" && grep -q 'has-conflicts: ' "$MERGE_GATE_WORKER_MD" ||
-      { GATE_POLICY_OK=0; echo "FAIL: the merge-gate validator is not told whether the pull request conflicted, so a conflict resolved on green CI is discarded" >&2; }
+    # An if, not `a && b || c`: shellcheck's SC2015 note failed every consumer's agentics-checks,
+    # which shellchecks this file at the default severity (found by hosted verify, QA-05).
+    if ! { grep -q 'has_conflicts=' "$VALIDATOR_SH" && grep -q 'has-conflicts: ' "$MERGE_GATE_WORKER_MD"; }; then
+      GATE_POLICY_OK=0; echo "FAIL: the merge-gate validator is not told whether the pull request conflicted, so a conflict resolved on green CI is discarded" >&2
+    fi
   fi
 fi
   # A rule holding a pull request is not a refusal aimed at us, and the loop must neither
@@ -317,7 +335,9 @@ fi
   # and the merge happens when the rule is satisfied.
   grep -qF -e "- name: Arm auto-merge when a rule is holding it" "$MERGE_GATE_WORKER_MD" ||
     { GATE_POLICY_OK=0; echo "FAIL: the merge gate has no arming step, so a protected repository would hand every bot pull request to a person" >&2; }
-  grep -q -- '--auto' "$MERGE_GATE_WORKER_MD" ||
+  # The arming itself is the step's script (FR-086).
+  { grep -q 'run: bash ./.github/actions/merge-gate/arm-auto-merge.sh' "$MERGE_GATE_WORKER_MD" &&
+    grep -q -- '--auto' "${HERE}/../merge-gate/arm-auto-merge.sh" 2>/dev/null; } ||
     { GATE_POLICY_OK=0; echo "FAIL: the merge gate never arms auto-merge; the deferred path is what merges a pull request a rule is holding" >&2; }
   # And it must not ask to be exempted from the rules it is waiting on.
   if grep -qiE 'bypass_actors|bypass_mode' "$MERGE_GATE_WORKER_MD"; then
@@ -326,6 +346,104 @@ fi
   fi
 
 if [ "$GATE_POLICY_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+
+echo "── The gate in shadow changes nothing (feature 007 X11, FR-027) ──────────"
+
+# Advice on a person's pull request is one comment and nothing else. Every job that labels,
+# comments, merges or pushes must ask the subject's `advise` output first, and the advisory job
+# exists exactly when this install turned shadow mode on: the classifier's constant, the gate's
+# env and the job are three projections of one profile value.
+SHADOW_OK=1
+if [ -f "$MERGE_GATE_WORKER_MD" ]; then
+  gate_src="$(tr -d '\r' <"$MERGE_GATE_WORKER_MD")"
+  for job in conclude incomplete; do
+    block="$(sed -n "/^  ${job}:\$/,/^  [a-z_]*:\$/p" <<<"$gate_src")"
+    grep -q "needs.subject.outputs.advise != 'true'" <<<"$block" ||
+      { SHADOW_OK=0; echo "FAIL: the merge gate's ${job} job does not refuse advise mode, so advice on a person's pull request could write" >&2; }
+  done
+  for step in "Release the issue" "Flag human review" "Explain the merge hold" "Hand the conflict to a human" \
+    "Say why the conflict was not resolved" "Comment on issue - problems found, solving them"; do
+    # The whole name: "Release the issue" is also the start of review mode's "Release the issue
+    # for apply-review", which sits in conclude and is guarded with the job.
+    condition="$(grep -A 1 -x -F -e "      - name: ${step}" <<<"$gate_src" | grep -E '^ +if:' || true)"
+    [ -n "$condition" ] ||
+      { SHADOW_OK=0; echo "FAIL: the merge-gate step '${step}' is missing or has no if:, so nothing stops it writing on advice" >&2; }
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$line" in
+        *"needs.subject.outputs.advise != 'true'"*) ;;
+        *) SHADOW_OK=0; echo "FAIL: the merge-gate step '${step}' writes without asking whether this run is advice" >&2 ;;
+      esac
+    done <<<"$condition"
+  done
+  installed_shadow="$(sed -n 's/^  SHADOW_HUMAN_PULL_REQUESTS: "\(.*\)"$/\1/p' <<<"$gate_src")"
+  [ "$installed_shadow" = "${SHADOW_HUMAN_PULL_REQUESTS:-}" ] ||
+    { SHADOW_OK=0; echo "FAIL: the gate says shadow mode is '${installed_shadow}' and the classifier '${SHADOW_HUMAN_PULL_REQUESTS:-}'; they were written from different profiles" >&2; }
+  if [ "${SHADOW_HUMAN_PULL_REQUESTS:-false}" = "true" ]; then
+    grep -q '^  advise:$' <<<"$gate_src" ||
+      { SHADOW_OK=0; echo "FAIL: shadow mode is on and the merge gate has no advise job, so a person's pull request is assessed and nothing is said" >&2; }
+    [ -f "${HERE}/../post-gate-advice/post-gate-advice.sh" ] ||
+      { SHADOW_OK=0; echo "FAIL: shadow mode is on and post-gate-advice.sh is not installed" >&2; }
+  elif grep -q '^  advise:$' <<<"$gate_src"; then
+    SHADOW_OK=0
+    echo "FAIL: shadow mode is off and the merge gate still carries its advise job" >&2
+  fi
+  grep -q "human-only: \${{ needs.classify.outputs.human-only" "$ROUTER_YML" ||
+    { SHADOW_OK=0; echo "FAIL: the router does not pass human-only to the gate, so a bot pull request's green run would be gated twice in shadow mode" >&2; }
+fi
+if [ "$SHADOW_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+
+echo "── The gate as a reviewer (feature 007 X08, FR-024) ──────────────────────"
+
+# Under `gate.mode: review` the gate never pushes: it requests changes as a review, apply-review
+# answers that one bot review, and the gate's own request never holds the gate. The installed
+# gate, apply-review and their scripts must agree on the mode and on the marker that tells the
+# gate's change request from a person's.
+REVIEW_MODE_OK=1
+APPLY_REVIEW_MD="${HERE}/../../workflows/agent-apply-review.md"
+if [ -f "$MERGE_GATE_WORKER_MD" ]; then
+  gate_src="$(tr -d '\r' <"$MERGE_GATE_WORKER_MD")"
+  gate_mode="$(sed -n 's/^  GATE_MODE: "\(.*\)"$/\1/p' <<<"$gate_src")"
+  gate_marker="$(sed -n 's/^  GATE_REVIEW_MARKER: "\(.*\)"$/\1/p' <<<"$gate_src")"
+  case "$gate_mode" in
+    fix | review) ;;
+    *) REVIEW_MODE_OK=0; echo "FAIL: the merge gate's GATE_MODE is '${gate_mode}', which is neither fix nor review" >&2 ;;
+  esac
+  # In either mode the gate's own change request must not hold it, or review mode deadlocks.
+  grep -q 'run: bash ./.github/actions/gate-review/review-blocked.sh' <<<"$gate_src" ||
+    { REVIEW_MODE_OK=0; echo "FAIL: the merge gate does not decide review_blocked with review-blocked.sh, so its own change request would hold every fix it asked for" >&2; }
+  if [ "$gate_mode" = review ]; then
+    for step in "Request the changes as a review" "Release the issue for apply-review" \
+      "Dismiss the gate's own change requests" "Decide the review-mode verdict"; do
+      grep -qF -e "- name: ${step}" <<<"$gate_src" ||
+        { REVIEW_MODE_OK=0; echo "FAIL: review mode is on and the merge gate has no '${step}' step" >&2; }
+    done
+    for script in review-blocked decide-review-outcome post-gate-review dismiss-gate-reviews; do
+      [ -f "${HERE}/../gate-review/${script}.sh" ] ||
+        { REVIEW_MODE_OK=0; echo "FAIL: review mode is on and gate-review/${script}.sh is not installed" >&2; }
+    done
+    if [ -f "$APPLY_REVIEW_MD" ]; then
+      apply_marker="$(tr -d '\r' <"$APPLY_REVIEW_MD" | sed -n 's/^  GATE_REVIEW_MARKER: "\(.*\)"$/\1/p')"
+      if [ -z "$gate_marker" ] || [ "$apply_marker" != "$gate_marker" ]; then
+        REVIEW_MODE_OK=0
+        echo "FAIL: the gate marks its change request '${gate_marker}' and apply-review looks for '${apply_marker}'; apply-review would never answer it" >&2
+      fi
+    else
+      REVIEW_MODE_OK=0
+      echo "FAIL: review mode is on and apply-review is not installed, so nothing would make the changes the gate requests" >&2
+    fi
+  # In fix mode the change-request step stays installed, because conclude reads its outcome,
+  # but it may only ever run under review: its guard names the mode.
+  elif grep -qF -e "- name: Request the changes as a review" <<<"$gate_src" &&
+    ! grep -qF -e "if: env.GATE_MODE == 'review' && needs.validate_output.outputs.outcome == 'changes'" <<<"$gate_src"; then
+    REVIEW_MODE_OK=0
+    echo "FAIL: the merge gate is in fix mode and its change-request step is not guarded by review mode" >&2
+  elif grep -qF -e "- name: Dismiss the gate's own change requests" <<<"$gate_src"; then
+    REVIEW_MODE_OK=0
+    echo "FAIL: the merge gate is in fix mode and still carries review mode's dismissal step" >&2
+  fi
+fi
+if [ "$REVIEW_MODE_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 
 echo "── Every scheduled route, both ends (research R7) ────────────────────────"
 
@@ -422,38 +540,26 @@ else
     resolve-merge-base bot-approve detect-pr-conflicts reconcile-bot-pr-runs audit-close cleanup-artifacts validate; do
     block="$(tr -d '\r' <"$ROUTER_YML" | sed -n "/^  ${job}:\$/,/^  [a-z][a-z0-9-]*:\$/p")"
     [ -n "$block" ] || continue
+    # A step that runs a managed script says what it did there (FR-086), so the script is
+    # read as part of the job.
+    while IFS= read -r called; do
+      [ -f "${HERE}/../${called}" ] && block="${block}"$'\n'"$(tr -d '\r' <"${HERE}/../${called}")"
+    done < <(grep -oE 'bash \./\.github/actions/[A-Za-z0-9_./-]+\.sh' <<<"$block" | sed 's|^bash \./\.github/actions/||')
     if ! grep -q 'record-outcome' <<<"$block" && ! grep -q 'outcome=' <<<"$block"; then
       OUTCOME_OK=0
       echo "FAIL: the ${job} job writes no outcome line, so a run in which it did nothing is indistinguishable from one in which it did something" >&2
     fi
   done
 
-  # Every reason literal, wherever it is written. The matrix itself is excluded: it names
-  # codes in its own failure messages, and a check that reads its own prose as evidence is
-  # not a check.
+  # Every reason literal, wherever it is written, from the one list the package's own test also
+  # reads (feature 007 QA-12: the two checks read different shapes and had drifted).
   while IFS= read -r used; do
     [ -n "$used" ] || continue
     if ! printf '%s\n' "${OUTCOME_REASONS[@]}" | grep -qxF "$used"; then
       OUTCOME_OK=0
       echo "FAIL: reason '${used}' is written in an installed file but is not in the enumeration in record-outcome.sh" >&2
     fi
-  done < <(
-    {
-      # This file is excluded by name, not by filtering its matches: -o prints the match
-      # alone, so a `grep -v verify-route-matrix` downstream has no path left to match on
-      # and excluded nothing. It went unnoticed while the matrix happened to write no
-      # reason literal of its own; the comment below then wrote one, and the check
-      # reported it against itself.
-      grep -rhoE --exclude='verify-route-matrix.sh' 'reason=[a-z][a-z-]*' "${HERE}/../"*/*.sh "${HERE}/../"*/*.yml "${HERE}/../../workflows"/*.yml "${HERE}/../../workflows"/*.md 2>/dev/null |
-        grep -v 'reason=<'
-      # A shell file assigns its reason to a variable and hands it over later, so the
-      # unquoted pattern above never saw one of them. Both shapes are read here: the
-      # promotion route collected eight codes this way, none of them checked against the
-      # enumeration until 12/09/2026.
-      grep -rhoE --exclude='verify-route-matrix.sh' 'reason="[a-z][a-z-]*"|skipped_because "[a-z][a-z-]*"' "${HERE}/../"*/*.sh 2>/dev/null |
-        sed -e 's/^skipped_because //' -e 's/^reason=//' -e 's/"//g' -e 's/^/reason=/'
-    } | sed 's/^reason=//' | sort -u
-  )
+  done < <(bash "${HERE}/../record-outcome/list-reasons.sh" "${HERE}/.." "${HERE}/../../workflows")
 fi
 if [ "$OUTCOME_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 
@@ -1017,41 +1123,50 @@ if [ "$RESCAN_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 # marker alone were progress notes and failed attempts, and the reconcile belt read every
 # one of them as final: a crashed or OOM-killed gate parked its pull request for the rest
 # of the night. Attempts are counted separately, capped, and reset by any new CI run.
+# Both dispatch paths -- the conflict sweep after a merge and the hourly reconcile belt --
+# decide this in one script they source (feature 007 WF-13), so these read that script and
+# check the router hands both paths to it.
 BELT_OK=1
-if ! grep -q 'agent-merge-gate-attempt' "$ROUTER_YML"; then
-  BELT_OK=0; echo "FAIL: router never counts gate attempts" >&2
+SWEEP_SH="${HERE}/../merge-gate-sweep/merge-gate-sweep.sh"
+if [ ! -f "$SWEEP_SH" ]; then
+  BELT_OK=0; echo "FAIL: the merge-gate sweep script is not installed beside the router's actions" >&2
+  SWEEP_SH=/dev/null
 fi
-if [ "$(grep -cF 'contains("<!-- agent-merge-gate -->")) and (.body | contains("**Verdict:**"))' "$ROUTER_YML")" -lt 4 ]; then
-  BELT_OK=0; echo "FAIL: verdict detection must pair the gate marker with a Verdict line in both dispatch paths" >&2
+if [ "$(grep -c '^ *\. "\$GITHUB_WORKSPACE/\.github/actions/merge-gate-sweep/merge-gate-sweep\.sh"$' "$ROUTER_YML")" -lt 2 ] ||
+  [ "$(grep -c 'ci="$(gate_ci "\$pr' "$ROUTER_YML")" -lt 2 ] ||
+  [ "$(grep -c 'dispatch_gate_if_due "\$pr' "$ROUTER_YML")" -lt 2 ]; then
+  BELT_OK=0; echo "FAIL: both dispatch paths must source the merge-gate sweep and decide through gate_ci and dispatch_gate_if_due" >&2
 fi
-if [ "$(grep -c 'attempts_so_far' "$ROUTER_YML")" -lt 2 ]; then
-  BELT_OK=0; echo "FAIL: dispatch sites must forward attempts_so_far" >&2
+if ! grep -q 'agent-merge-gate-attempt' "$SWEEP_SH"; then
+  BELT_OK=0; echo "FAIL: the merge-gate sweep never counts gate attempts" >&2
+fi
+if ! grep -qF 'contains("<!-- agent-merge-gate -->")) and (.body | contains("**Verdict:**"))' "$SWEEP_SH"; then
+  BELT_OK=0; echo "FAIL: verdict detection must pair the gate marker with a Verdict line" >&2
+fi
+if ! grep -q 'inputs\[attempts_so_far\]' "$SWEEP_SH"; then
+  BELT_OK=0; echo "FAIL: the dispatch must forward attempts_so_far" >&2
 fi
 # A second gate for a pull request whose gate is already queued or running reads the same CI
 # verdict and is cancelled by the single-slot merge-belt queue (two cancellations on 2026-09-06).
-if [ "$(grep -c 'a merge-gate run is already live' "$ROUTER_YML")" -lt 2 ]; then
-  BELT_OK=0; echo "FAIL: both dispatch paths must skip a pull request whose gate is already live" >&2
+if ! grep -q 'a merge-gate run is already live' "$SWEEP_SH"; then
+  BELT_OK=0; echo "FAIL: the dispatch must skip a pull request whose gate is already live" >&2
 fi
 # A conflicting pull request has no refs/pull/N/merge for GitHub to build, so a `pull_request`
 # CI workflow can never run on that head. Requiring a fresh verdict before dispatching deadlocks
-# the belt: only the gate resolves the conflict, and the gate never runs. Both paths fall back to
-# the branch's last verdict when, and only when, the pull request is conflicting.
-if [ "$(grep -c 'conflicts, so CI cannot run on' "$ROUTER_YML")" -lt 2 ]; then
+# the belt: only the gate resolves the conflict, and the gate never runs. The sweep falls back
+# to the branch's last verdict when, and only when, the pull request is conflicting.
+if ! grep -q 'conflicts, so CI cannot run on' "$SWEEP_SH"; then
   BELT_OK=0
-  echo "FAIL: both dispatch paths must gate a conflicting pull request that can never get fresh CI" >&2
+  echo "FAIL: the sweep must gate a conflicting pull request that can never get fresh CI" >&2
 fi
-# That fallback has to read the computed mergeable state. The REST boolean is null until GitHub
-# recomputes it, and stays null for a pull request nobody has opened recently, which is exactly
-# the stale conflicting pull request the fallback exists for: it never fired once in production.
-# The state has to be polled, not read once. GitHub computes mergeability on demand and the
-# first read answers UNKNOWN (or null through REST) while it works it out, so a single read
-# reports "not conflicting" for exactly the stale pull requests the fallback is for. Observed
-# twice in production: the fallback logged "no completed CI run" for a pull request that
-# `gh pr view` reported as CONFLICTING from a warm cache seconds later.
-if [ "$(grep -c 'mergeable_state()' "$ROUTER_YML")" -lt 2 ] ||
-  [ "$(grep -c 'mergeable_now=$(mergeable_state' "$ROUTER_YML")" -lt 2 ]; then
+# That fallback has to read the computed mergeable state, polled rather than read once:
+# GitHub computes mergeability on demand and the first read answers UNKNOWN (or null through
+# REST), so a single read reports "not conflicting" for exactly the stale pull requests the
+# fallback is for. Observed twice in production.
+if ! grep -q '^mergeable_state() {' "$SWEEP_SH" ||
+  ! grep -q '\[ "$(mergeable_state "$pr")" = "CONFLICTING" \]' "$SWEEP_SH"; then
   BELT_OK=0
-  echo "FAIL: both dispatch paths must poll the mergeable state; a single read answers UNKNOWN" >&2
+  echo "FAIL: the sweep must poll the mergeable state; a single read answers UNKNOWN" >&2
 fi
 if [ "$BELT_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 
@@ -1196,12 +1311,17 @@ if [ "$PENDING_OK" -eq 1 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 # worked for half an hour and then failed produced an answer that was wrong, and repeating it
 # costs the fleet the same half hour to be wrong again.
 IMPLEMENT_RETRY_OK=1
-for needle in 'RETRY_UNDER_MINUTES' 'ATTEMPT_MARKER' 'attempts_so_far' 'operation=implement'; do
+for needle in 'RETRY_UNDER_MINUTES' 'ATTEMPT_MARKER' 'attempts_so_far' 'bash ./.github/actions/retry-pending/redispatch-implement.sh'; do
   grep -qF "$needle" "$IMPLEMENT_WORKER_MD" || {
     IMPLEMENT_RETRY_OK=0
     echo "FAIL: implement worker lost its retry belt: no '$needle'" >&2
   }
 done
+# The re-dispatch itself is the script's (FR-086).
+grep -qF 'operation=implement' "${HERE}/../retry-pending/redispatch-implement.sh" 2>/dev/null || {
+  IMPLEMENT_RETRY_OK=0
+  echo "FAIL: the implement retry no longer re-dispatches the implement operation" >&2
+}
 # Park and retry are mutually exclusive: the retry path must never add the review label, and
 # the park path must never re-dispatch.
 grep -A3 'Flag for human review' "$IMPLEMENT_WORKER_MD" | grep -q "retry != 'true'" ||
@@ -1278,7 +1398,7 @@ done < <(sed -n '/^      operation:/,/^      issue-number:/p' "$ROUTER_YML" |
 #
 # A worker the repository did not select is skipped rather than failed -- which capabilities
 # are installed is a different question, asked elsewhere.
-readonly ROUTE_MODELS="agent-implement.md=claude-sonnet-5 agent-refine.md=claude-sonnet-5 agent-triage.md=claude-sonnet-5 agent-apply-review.md=claude-sonnet-5 agent-merge-gate.md=claude-sonnet-5 agent-audit.md=claude-sonnet-5 agent-release.md=claude-sonnet-5"
+readonly ROUTE_MODELS="agent-implement.md=openai/claude-sonnet-5 agent-refine.md=openai/claude-sonnet-5 agent-triage.md=openai/claude-sonnet-5 agent-apply-review.md=openai/claude-sonnet-5 agent-merge-gate.md=openai/claude-sonnet-5 agent-audit.md=openai/claude-sonnet-5 agent-release.md=openai/claude-sonnet-5"
 
 for pair in $ROUTE_MODELS; do
   worker="${HERE}/../../workflows/${pair%%=*}"
@@ -1302,8 +1422,8 @@ done
 # every other engine the framework still declares it in the lock for its own OAuth-token
 # probe. Scanning generated output would fail four engines for a name the framework chose,
 # and the lock is derived from the sources this does scan.
-readonly ENGINE_ID="claude"
-readonly FOREIGN_CREDENTIAL_VARS="CODEX_API_KEY COPILOT_GITHUB_TOKEN GEMINI_API_KEY OPENAI_API_KEY"
+readonly ENGINE_ID="opencode"
+readonly FOREIGN_CREDENTIAL_VARS="ANTHROPIC_API_KEY COPILOT_GITHUB_TOKEN GEMINI_API_KEY"
 
 engine_scan_files() {
   local candidate
@@ -1319,8 +1439,12 @@ engine_scan_files() {
 
 for variable in $FOREIGN_CREDENTIAL_VARS; do
   offenders=""
+  # A repository secret may carry any name, another engine's variable's included: an
+  # OpenAI-compatible gateway reached with a key stored as ANTHROPIC_API_KEY is mapped onto
+  # OPENAI_API_KEY, which is what this engine reads (feature 007 T113). So `secrets.<name>` is not
+  # a use of the variable; the variable a file sets or reads is.
   while read -r scanned; do
-    if grep -qF "$variable" "$scanned"; then offenders="${offenders} ${scanned##*/}"; fi
+    if sed -E 's/secrets\.[A-Za-z0-9_]+//g' "$scanned" | grep -qF "$variable"; then offenders="${offenders} ${scanned##*/}"; fi
   done < <(engine_scan_files)
 
   if [ -z "$offenders" ]; then
@@ -1330,6 +1454,183 @@ for variable in $FOREIGN_CREDENTIAL_VARS; do
     echo "FAIL: this repository runs '${ENGINE_ID}', which never reads ${variable}, but it is named in:${offenders}" >&2
   fi
 done
+
+# A snapshot promotion folds the target stage's changelog into its head under `merge`, or every
+# promotion after the first conflicts on the changelog alone (loopscope #279, 22/11/2026). The
+# behaviour is tested in the package (promote-snapshot-changelog.test.ts); this checks an
+# install carries the script and the route calls it.
+PROMOTE_SH="${HERE}/../promote-change/promote-change.sh"
+if [ -f "$PROMOTE_SH" ]; then
+  if [ -f "${HERE}/../update-changelog/fold-target-changelog.sh" ] &&
+    grep -q 'update-changelog/fold-target-changelog.sh' "$PROMOTE_SH"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: snapshot promotions do not fold the target's changelog, so each one after the first conflicts on it" >&2
+  fi
+fi
+
+# A run that ended for a reason that passes keeps its label and a marker, and the hourly belt
+# starts it again; an implement retry names the run it comes from, or the router drops it as a
+# duplicate of that run (FR-113; loopscope #164, #265, #268). Behaviour is tested in the
+# package (retry-pending.test.ts); this checks an install is wired for it.
+RETRY_OK=1
+[ -f "${HERE}/../retry-pending/retry-pending.sh" ] && [ -f "${HERE}/../retry-pending/classify-incomplete.sh" ] || RETRY_OK=0
+grep -q 'bash ./.github/actions/retry-pending/retry-pending.sh' "$ROUTER_YML" || RETRY_OK=0
+grep -q 'RETRY_OF: ${{ inputs.retry-of' "$ROUTER_YML" || RETRY_OK=0
+for worker in agent-implement agent-refine; do
+  file="${HERE}/../../workflows/${worker}.md"
+  [ -f "$file" ] || continue
+  grep -q 'retry-pending/classify-incomplete.sh' "$file" || RETRY_OK=0
+  grep -q '<!-- agent-retry-pending: ' "$file" || RETRY_OK=0
+done
+if [ "$RETRY_OK" -eq 1 ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: incomplete runs are not retried: the belt's sweep, the classifier, a worker's marker or the router's retry-of exclusion is missing" >&2
+fi
+# A run that ended on the provider's temporary answer is an outage however long it ran, and is
+# asked before the refusal signature, which the CLI's wording of it matches (FR-123, loopscope #363).
+CLASSIFIER_SH="${HERE}/../retry-pending/classify-incomplete.sh"
+if [ -f "$CLASSIFIER_SH" ] && grep -q 'Just a moment' "$CLASSIFIER_SH" &&
+  grep -q 'elif \[ "\$transient" = true \]; then' "$CLASSIFIER_SH"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: a run that ended on a provider challenge page or 5xx is handed to a person, not retried" >&2
+fi
+
+# The metrics contract pins the agent step's name (constitution 1.6.0, Principle VI): gh-aw calls
+# it `Execute <engine> CLI` under every engine compiled, and a collector finds the agent's run by
+# it. Checked wherever this repository's locks are compiled; a payload with no locks has none to
+# check (feature 007 APP-05, FR-099).
+STEP_NAME_OK=1
+for lock in "${HERE}"/../../workflows/agent-*.lock.yml; do
+  [ -f "$lock" ] || continue
+  grep -qE '^ +- name: Execute [A-Za-z][A-Za-z ]* CLI$' "$lock" || { STEP_NAME_OK=0; echo "  ${lock##*/}: no 'Execute <engine> CLI' step" >&2; }
+done
+if [ "$STEP_NAME_OK" -eq 1 ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: an agent lock's agent step is not named 'Execute <engine> CLI', the pinned metrics contract" >&2
+fi
+
+# A split's safe outputs are normalised before the handlers read them: temporary IDs gh-aw would
+# reject are renamed and children a half-finished run filed are reused (FR-114, loopscope #265).
+# Behaviour is tested in the package (normalise-split-output.test.ts); this checks the wiring.
+REFINE_MD="${HERE}/../../workflows/agent-refine.md"
+if [ -f "$REFINE_MD" ]; then
+  if [ -f "${HERE}/../normalise-split-output/normalise-split-output.sh" ] &&
+    sed -n '/^post-steps:$/,/^steps:$/p' "$REFINE_MD" | grep -q 'normalise-split-output/normalise-split-output.sh' &&
+    grep -q 'reused_children' "${HERE}/../validate-refine-output/validate-refine-output.sh"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: refine does not normalise a split before the handlers run, so one rejected temporary ID loses every child after the first" >&2
+  fi
+fi
+
+# The implement agent works on a branch made for it and names that branch in create_pull_request,
+# which builds the pull request from the local branch of that name (FR-115, loopscope #290).
+if [ -f "$IMPLEMENT_WORKER_MD" ]; then
+  if sed -n '/^pre-agent-steps:$/,/^safe-outputs:$/p' "$IMPLEMENT_WORKER_MD" | grep -q 'git switch -C "\$WORK_BRANCH"' &&
+    grep -qF 'branch: "${{ env.WORK_BRANCH }}"' "$IMPLEMENT_WORKER_MD"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: the implement agent is not put on a named work branch, so under a chain its commits can be found nowhere" >&2
+  fi
+fi
+
+# Why implement opened no pull request is read from the agent's structured output first, and
+# its archived log only as a fallback (feature 007 WF-12, FR-073).
+OUTCOME_SH="${HERE}/../read-implement-outcome/read-implement-outcome.sh"
+if [ -f "$IMPLEMENT_WORKER_MD" ]; then
+  if grep -qF 'artifact-name: ${{ needs.activation.outputs.artifact_prefix }}agent' "$IMPLEMENT_WORKER_MD" &&
+    grep -qF 'bash ./.github/actions/read-implement-outcome/read-implement-outcome.sh' "$IMPLEMENT_WORKER_MD" &&
+    [ -f "$OUTCOME_SH" ] && grep -q 'select(.type == "report_incomplete")' "$OUTCOME_SH"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: implement reads its outcome only by scraping the agent job's log" >&2
+  fi
+fi
+
+# A pull request's issue is a marker on a line of its own, never one quoted in prose (loopscope
+# PR #329, 22/11/2026).
+RESOLVE_SH="${HERE}/../resolve-pr-issue/resolve-pr-issue.sh"
+if [ -f "$RESOLVE_SH" ]; then
+  # shellcheck source=SCRIPTDIR/../resolve-pr-issue/resolve-pr-issue.sh
+  # shellcheck disable=SC2016 # the backticks are the quoted prose, not a substitution
+  if [ "$(. "$RESOLVE_SH"; printf 'See `<!-- implement-issue: 207 -->`.\n\n<!-- implement-issue: 318 -->\n' | marker_issues)" = 318 ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: a marker quoted in a pull request's prose is taken for the issue it belongs to" >&2
+  fi
+fi
+
+# A run ending starts the reconcile belt, so queued work does not wait on a schedule GitHub may
+# not fire (FR-116, loopscope 22/11/2026).
+if [ -f "$IMPLEMENT_WORKER_MD" ]; then
+  if [ "$(grep -c 'uses: ./.github/actions/pick-up-queued-work' "$IMPLEMENT_WORKER_MD")" -ge 2 ] &&
+    [ -f "${HERE}/../pick-up-queued-work/action.yml" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: implement's terminal jobs leave queued work to the reconcile schedule alone" >&2
+  fi
+fi
+
+# A diff holding a terminal escape sequence reaches the agent: gh 2.97 refuses to print one
+# without --allow-escape-sequences, and the gate crashed on loopscope #348 (22/11/2026).
+# Both fetches are scripts the workers run (FR-086).
+for pair in "${MERGE_GATE_WORKER_MD}:merge-gate/fetch-gate-context.sh" \
+  "${HERE}/../../workflows/agent-apply-review.md:fetch-review-context/fetch-review-context.sh"; do
+  worker="${pair%:*}"; fetch="${HERE}/../${pair##*:}"
+  [ -f "$worker" ] || continue
+  if grep -qF "run: bash ./.github/actions/${pair##*:}" "$worker" &&
+    grep -q 'gh pr diff "\$PR" --repo "\$REPO" "\${diff_flags\[@\]}"' "$fetch" 2>/dev/null &&
+    ! grep -q 'gh pr diff "\$PR" --repo "\$REPO" >' "$fetch"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $(basename "$worker") fetches the diff without --allow-escape-sequences" >&2
+  fi
+done
+
+# Apply-review's push survives a merge of the target branch: gh-aw judges protected files
+# against the old head, the gate judges the net change (FR-120, loopscope #319).
+APPLY_REVIEW_MD="${HERE}/../../workflows/agent-apply-review.md"
+if [ -f "$APPLY_REVIEW_MD" ]; then
+  if awk '/^  push-to-pull-request-branch:/{p=1;next} p&&/^  [a-z]/{p=0} p&&/^    protected-files: allowed/{f=1} END{exit !f}' "$APPLY_REVIEW_MD"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: apply-review's push refuses protected files a merge of the target brings in" >&2
+  fi
+  # After a pushed fix the person whose change request holds the gate is asked to look again
+  # (FR-121, loopscope #329).
+  if grep -q 'run: bash ./.github/actions/ask-for-re-review/ask-for-re-review.sh' "$APPLY_REVIEW_MD" &&
+    [ -f "${HERE}/../ask-for-re-review/ask-for-re-review.sh" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: apply-review leaves a standing change request holding the gate unannounced" >&2
+  fi
+fi
+
+# A clean assessment left to a person is looked at again once its base merges unattended: the
+# sweep reads the installed policy, and both router sweeps hand it over (FR-109).
+if grep -q '^policy_merges_unattended()' "$SWEEP_SH" &&
+  [ "$(grep -c 'AUTO_MERGE_TARGETS: "' "$ROUTER_YML")" -ge 2 ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: the merge-gate sweep never re-assesses an approval made under an older auto-merge policy" >&2
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

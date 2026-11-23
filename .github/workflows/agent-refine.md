@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-refine.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-refine.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   REPO_RULES: "Install with the lockfile frozen; an install that resolves a different tree is not reproducing the change under review. Run scripts through pnpm rather than npx, or a second package manager's lockfile appears in the diff."
   PLAN_EXPLORE_SKILL: plan-explore
@@ -20,7 +20,11 @@ env:
   SPLIT_CHILDREN_PREFIX: "<!-- split-into: "
   SPLIT_THRESHOLD: "8"
   MAX_SPLIT_CHILDREN: "6"
-  INCOMPLETE_COMMENT: "Automated refinement ended without an outcome. The refine label remains for a retry."
+  INCOMPLETE_COMMENT: "Automated refinement ended without an outcome, and not for a reason that passes on its own, so the issue is flagged for review."
+  # What an incomplete run is retried on (FR-113): a short run the provider did not refuse looks
+  # like an outage, and the provider's own refusal words say it is the account instead.
+  RETRY_UNDER_MINUTES: "6"
+  REFUSAL_SIGNATURE: "insufficient_quota|billing_error|credit balance is too low|payment_required|authentication_failed|invalid_api_key|invalid api key"
   SAFE_OUTPUT_COMMENT_PREFIX: "Refinement update"
   ISSUE_CONTEXT_PATH: /tmp/gh-aw/agent/issue-context.json
   GH_AW_ALLOWED_BOTS: "personalcorpacc-agentic-loop[bot],github-actions[bot]"
@@ -48,8 +52,11 @@ description: |
 name: "Agent: Refine Issue"
 
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -80,6 +87,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # GITHUB_TOKEN on purpose. A label applied by the app raises a labeled event, and the
       # classifier routes bot-working straight back into this same worker: the second run
       # queues behind this one and then executes, doing the work twice. Nothing needs to see
@@ -148,6 +162,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # No apply-agent-output here. safe_outputs already creates the split children, links
       # them as sub-issues of the parent and rewrites the parent body; running the action too
       # filed a second unlinked, unlabelled copy of every child.
@@ -200,56 +221,7 @@ jobs:
           REPO: ${{ github.repository }}
           PARENT: ${{ inputs.issue-number }}
           OUTCOME: ${{ needs.validate_output.outputs.outcome }}
-        run: |
-          set -euo pipefail
-
-          label_one() {
-            local issue="$1"
-            local body points
-            body=$(gh issue view "$issue" --repo "$REPO" --json body --jq '.body // ""')
-            points=$(printf '%s' "$body" | grep -oE '<!-- estimate: [0-9]+ -->' | head -1 | grep -oE '[0-9]+' || true)
-            # The agent writes the readable line every time and the HTML marker only sometimes,
-            # so read the line too rather than leaving the issue with no estimate label at all.
-            [ -n "$points" ] || points=$(printf '%s' "$body" | grep -oiE '\*\*estimate:\*\*[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
-            if [ -z "$points" ]; then
-              echo "::warning::#$issue carries no estimate marker; no points label applied."
-              return 0
-            fi
-            case "$points" in
-              1|2|3|5|8|13|21) ;;
-              *) echo "::warning::#$issue estimate '$points' is not a Fibonacci point value; skipping."; return 0 ;;
-            esac
-            # A re-refine re-estimates, so the previous value must not linger beside the new one.
-            for old in $(gh issue view "$issue" --repo "$REPO" --json labels --jq '.labels[].name | select(startswith("sp-"))'); do
-              [ "$old" = "sp-$points" ] || gh issue edit "$issue" --repo "$REPO" --remove-label "$old" >/dev/null
-            done
-            gh label create "sp-$points" --repo "$REPO" --color BFD4F2 \
-              --description "Story points: $points (about $points human days)" >/dev/null 2>&1 || true
-            gh issue edit "$issue" --repo "$REPO" --add-label "sp-$points" >/dev/null
-            echo "#$issue estimated at $points point(s)"
-          }
-
-          label_one "$PARENT"
-
-          # safe_outputs links every child as a sub-issue of the parent, and the tool writes that
-          # link rather than the agent, so it is there even when the body marker the agent was
-          # asked for is missing, which is the usual case. The marker search stays as a fallback.
-          list_children() {
-            local found
-            found=$(gh api "repos/$REPO/issues/$PARENT/sub_issues" --jq '.[].number' 2>/dev/null || true)
-            if [ -z "$found" ]; then
-              found=$(gh issue list --repo "$REPO" --state open --limit 50 \
-                --search "\"<!-- split-parent: ${PARENT} -->\" in:body" --json number --jq '.[].number' || true)
-            fi
-            printf '%s\n' "$found"
-          }
-
-          if [ "$OUTCOME" = "split" ]; then
-            for child in $(list_children); do
-              [ "$child" = "$PARENT" ] && continue
-              label_one "$child"
-            done
-          fi
+        run: bash ./.github/actions/label-estimates/label-estimates.sh
       # safe_outputs writes the children with GITHUB_TOKEN, and a label applied by that token
       # raises no labeled event, so the router never sees a child and the split stalls with the
       # work sitting in issues nobody picked up. Re-applying the label as the app raises the
@@ -265,29 +237,7 @@ jobs:
           REFINE_LABEL: ${{ env.REFINE_LABEL }}
           REFINED_LABEL: ${{ env.REFINED_LABEL }}
           IMPLEMENT_LABEL: ${{ env.IMPLEMENT_LABEL }}
-        run: |
-          set -euo pipefail
-
-          children=$(gh api "repos/$REPO/issues/$PARENT/sub_issues" --jq '.[].number' 2>/dev/null || true)
-          if [ -z "$children" ]; then
-            children=$(gh issue list --repo "$REPO" --state open --limit 50 \
-              --search "\"<!-- split-parent: ${PARENT} -->\" in:body" --json number --jq '.[].number' || true)
-          fi
-          for child in $children; do
-            [ "$child" = "$PARENT" ] && continue
-            # A child handed over earlier carries the refined label. Handing it again would start
-            # a second implement run on work already in flight.
-            if gh issue view "$child" --repo "$REPO" --json labels --jq '.labels[].name' \
-              | grep -qx "$REFINED_LABEL"; then
-              echo "#$child was already handed over; leaving it alone"
-              continue
-            fi
-            gh issue edit "$child" --repo "$REPO" \
-              --remove-label "$REFINE_LABEL" --remove-label "$IMPLEMENT_LABEL" >/dev/null 2>&1 || true
-            gh issue edit "$child" --repo "$REPO" --add-label "$REFINED_LABEL" >/dev/null
-            gh issue edit "$child" --repo "$REPO" --add-label "$IMPLEMENT_LABEL" >/dev/null
-            echo "#$child handed to implement"
-          done
+        run: bash ./.github/actions/hand-split-children/hand-split-children.sh
       - name: Flag questions for review
         if: needs.validate_output.outputs.outcome == 'questions'
         uses: ./.github/actions/add-issue-labels
@@ -311,8 +261,17 @@ jobs:
           route: refine
           subject: ${{ format('#{0}', inputs.issue-number) }}
           detail: "${{ job.status == 'success' && 'The issue was refined and its labels moved on.' || 'The refine conclusion did not finish; the step log says where it stopped.' }}"
+      # A run ending is an event GitHub always delivers; its schedules it does not (FR-116). So
+      # each terminal job starts the reconcile belt -- queued work, cleared blockers, retries --
+      # instead of leaving that to a cron that may not fire for hours.
+      - name: Pick up queued work
+        if: always()
+        uses: ./.github/actions/pick-up-queued-work
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.event.repository.default_branch }}
   incomplete:
-    needs: [agent, safe_outputs, validate_output]
+    needs: [activation, agent, safe_outputs, validate_output]
     if: >
       always() &&
       (
@@ -324,6 +283,8 @@ jobs:
     permissions:
       contents: read
       issues: write
+      # the classifier reads the agent job's duration and log
+      actions: read
     steps:
       - name: Checkout workflow actions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -333,19 +294,51 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
+      # The daily AI-credit allowance and a provider outage pass on their own, so neither is a
+      # person's: the issue keeps `refine`, and the hourly sweep retries it (FR-113). This job
+      # used to add `review` and promise a retry that nothing made (loopscope #265 and #268).
+      - name: Classify the failure
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          UNDER_MINUTES: ${{ env.RETRY_UNDER_MINUTES }}
+          REFUSAL_SIGNATURE: ${{ env.REFUSAL_SIGNATURE }}
+          CREDITS_EXCEEDED: ${{ needs.activation.outputs.daily_ai_credits_exceeded || 'false' }}
+        run: bash ./.github/actions/retry-pending/classify-incomplete.sh
       - name: Release the issue
         uses: ./.github/actions/remove-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ inputs.issue-number }}
           labels: ${{ env.WORKING_LABEL }}
+      - name: Say the run will be retried
+        if: steps.classify.outputs.kind == 'credits' || steps.classify.outputs.kind == 'outage'
+        uses: ./.github/actions/create-issue-comment
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          issue-number: ${{ inputs.issue-number }}
+          body: |
+            <!-- agent-retry-pending: refine ${{ steps.classify.outputs.kind }} -->
+            ${{ steps.classify.outputs.kind == 'credits' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it).', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || steps.classify.outputs.transient == 'true' && format('Refinement ended after {0} minutes on a temporary answer from the model provider (a challenge page or a server error), not a refusal.', steps.classify.outputs.minutes) || format('Refinement ended after {0} minutes without an outcome, which is what a provider outage looks like.', steps.classify.outputs.minutes) }} Nothing is wrong with the issue. It keeps `${{ env.REFINE_LABEL }}`, and the hourly sweep starts it again.
+            [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
       - name: Flag for human review
+        if: steps.classify.outputs.kind != 'credits' && steps.classify.outputs.kind != 'outage'
         uses: ./.github/actions/add-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ inputs.issue-number }}
           labels: ${{ env.REVIEW_LABEL }}
       - name: Report missing refinement outcome
+        if: steps.classify.outputs.kind != 'credits' && steps.classify.outputs.kind != 'outage'
         uses: ./.github/actions/create-issue-comment
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -353,7 +346,17 @@ jobs:
           body: |
             ${{ env.REFINE_MARKER }}
             ${{ env.INCOMPLETE_COMMENT }}
+            ${{ needs.activation.outputs.daily_ai_credits_exceeded == 'true' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it). Work resumes once the day''s usage is back under it; raise the variable to allow more.', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || '' }}
             [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+      # A run ending is an event GitHub always delivers; its schedules it does not (FR-116). So
+      # each terminal job starts the reconcile belt -- queued work, cleared blockers, retries --
+      # instead of leaving that to a cron that may not fire for hours.
+      - name: Pick up queued work
+        if: always()
+        uses: ./.github/actions/pick-up-queued-work
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.event.repository.default_branch }}
 
 if: inputs.issue-number != ''
 
@@ -361,19 +364,44 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
+  id: opencode
+  version: "2.0.26"
   # The agent job's own concurrency group, per issue. The compiler's default is one group per
   # workflow, which serialised this worker across the whole repository whatever the router
   # allowed; the router's caller job owns the real limit (review WF-06).
   concurrency:
     group: "gh-aw-refine-${{ inputs.issue-number }}"
     cancel-in-progress: false
-model: claude-sonnet-5
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+  args:
+    # OpenCode's command line. The engines that take their model from the `model:` key above
+    # need no arguments, and this block goes with them (FR-076).
+    - "--model"
+    - "anthropic-compat/claude-sonnet-5"
+
+model: openai/claude-sonnet-5
 max-turns: 500
 max-turn-cache-misses: 4000
 max-ai-credits: 8000
 
 permissions: read-all
+
+# After gh-aw has ingested the agent's output and before it is uploaded for the handlers: rename
+# temporary IDs gh-aw would reject and drop children a half-finished run already filed, so a
+# split cannot lose its children to one bad name or file them twice (FR-114, loopscope #265).
+post-steps:
+  - name: Normalise a split's safe outputs
+    if: always()
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PARENT: ${{ inputs.issue-number }}
+      SPLIT_PARENT_PREFIX: ${{ env.SPLIT_PARENT_PREFIX }}
+    run: bash ./.github/actions/normalise-split-output/normalise-split-output.sh
 
 steps:
   - name: Load the issue context for the agent
@@ -383,6 +411,8 @@ steps:
       issue-number: ${{ inputs.issue-number }}
       output-path: ${{ env.ISSUE_CONTEXT_PATH }}
 
+# Each run's OpenTelemetry GenAI spans -- duration, tokens, model, outcome; never prompt or
+# response content -- go to the profile's OTLP endpoint (feature 007 X14, FR-074).
 safe-outputs:
   # A failed run is already a red run. An issue per failure buries the real backlog
   # under noise nobody closes.
@@ -419,6 +449,10 @@ timeout-minutes: 40
 3. Explore before you write. Call skill("${{ env.PLAN_EXPLORE_SKILL }}") and hold its stance for this step:
    read-only, no plans, no files, no branches. You are only building understanding here, never
    producing artifacts.
+
+   The agent kit's skills are files at `.agents/skills/<name>/SKILL.md` and its commands at
+   `.opencode/commands/<name>.md`. Where your tools have no skill or command by that name, read
+   that file and follow it; it is the same instruction. Do not stop or search for it elsewhere.
 
    Split the issue into work units first. If the issue body is a bullet list of distinct tasks
    (for example "- check the button component", "- then check the login", "- then suggest a
@@ -520,14 +554,20 @@ timeout-minutes: 40
    a complete refined story in the same format you would have written for the whole, with its own
    acceptance criteria, its own tests section, and its own estimate of 5 or less. Never write a
    child estimated at 1: that is a fragment, so fold it into a sibling. Call `create_issue` once
-   per child, and in each child body include:
+   per child, in order, and give each a `temporary_id` of exactly `aw_child1`, `aw_child2`, and so
+   on: `aw_` and then 3 to 8 letters or digits is the only shape accepted, and a child with any
+   other ID is created without its links. In each child body include:
 
-   - the line `${{ env.SPLIT_PARENT_PREFIX }}N -->` naming the parent issue number
-   - a `Blocked by #M` line naming any sibling that must land first, when order genuinely matters
+   - the line `${{ env.SPLIT_PARENT_PREFIX }}${{ inputs.issue-number }} -->` naming the parent
+   - when order genuinely matters, a `Blocked by #aw_childK` line naming an *earlier* sibling,
+     and the same sibling in the item's `blocked_by` field (`blocked_by: "aw_childK"`). The
+     children have no numbers yet; each `#aw_childK` becomes the sibling's issue number when it
+     is created, which is why a child may only wait for one created before it.
 
    Then call `update_issue` on the parent, with `issue_number: ${{ inputs.issue-number }}`,
    replacing its body with a short summary of the whole
-   piece of work, the reason it was split, and a checklist linking every child. The parent keeps
+   piece of work, the reason it was split, and a checklist linking every child as `#aw_child1`,
+   `#aw_child2` and so on. The parent keeps
    its own honest estimate. Do not write acceptance criteria on the parent: the children own them.
 
    **If it genuinely does not split**, because the work is one indivisible change, keep it as a

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/validate-refine-output/validate-refine-output.sh. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/validate-refine-output/validate-refine-output.sh. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 # Print the deterministic Refine outcome: complete, split, questions, or invalid.
 
 set -euo pipefail
@@ -26,9 +26,12 @@ jq -r --arg marker "$marker" --arg prefix "$comment_prefix" --arg issue "$issue_
   # A split writes children, which are the only items allowed to target something other than
   # the source issue: they do not exist yet, so they carry no number at all.
   def child_count:
-    [.items[] | select(.type == "create_issue" and
+    ([.items[] | select(.type == "create_issue" and
       (.body | type == "string") and (.body | test("[^[:space:]]")) and
-      (.title | type == "string") and (.title | test("[^[:space:]]")))] | length;
+      (.title | type == "string") and (.title | test("[^[:space:]]")))] | length)
+    # Children a half-finished earlier run already filed, which normalise-split-output took
+    # out of the items so they are not filed twice (FR-114).
+    + ((.reused_children // []) | length);
 
   def has_only_source_items:
     all(.items[];
