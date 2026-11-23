@@ -25,6 +25,21 @@ test("formats in the largest unit that divides exactly", () => {
   assert.equal(format(1_209_600_000), "2w");
 });
 
+test("formats zero as 0s instead of throwing", () => {
+  assert.equal(format(0), "0s");
+});
+
+test("still refuses negative, fractional, and non-numeric durations", () => {
+  assert.throws(() => format(-1));
+  assert.throws(() => format(1.5));
+  assert.throws(() => format("5"));
+  assert.throws(() => format(NaN));
+});
+
+test("parse still refuses 0s", () => {
+  assert.equal(parse("0s"), null);
+});
+
 test("prefers weeks over days when a value divides exactly", () => {
   assert.equal(format(parse("14d")), "2w");
   assert.equal(format(parse("10d")), "10d");
