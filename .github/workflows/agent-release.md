@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-release.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-release.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   GIT_AUTHOR_NAME: "personalcorpacc-agentic-loop[bot]"
   GIT_AUTHOR_EMAIL: "personalcorpacc-agentic-loop[bot]@users.noreply.github.com"
@@ -20,8 +20,11 @@ description: |
 name: "Agent: Release"
 
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -35,8 +38,15 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
-model: claude-sonnet-5
+  id: opencode
+  version: "2.0.26"
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+
+model: openai/claude-sonnet-5
 
 max-turns: 100
 max-turn-cache-misses: 3000
@@ -53,28 +63,7 @@ steps:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent
-
-      last_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-      if [ -n "$last_tag" ]; then
-        git log --oneline --no-decorate "${last_tag}..HEAD" > /tmp/gh-aw/agent/git-log.txt
-      else
-        git log --oneline --no-decorate -50 > /tmp/gh-aw/agent/git-log.txt
-      fi
-
-      case "$VERSION_SOURCE" in
-        package-manifest) version=$(jq -r '.version // "0.0.0"' package.json 2>/dev/null || echo "0.0.0") ;;
-        git-tag) version=$(git describe --tags --abbrev=0 2>/dev/null || echo ""); version=${version#v}; version=${version:-0.0.0} ;;
-        python-project) version=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' pyproject.toml 2>/dev/null | head -1 || echo ""); version=${version:-0.0.0} ;;
-        none) version="0.0.0" ;;
-        *) echo "::error::Unknown version source: $VERSION_SOURCE"; exit 1 ;;
-      esac
-      echo "$version" > /tmp/gh-aw/agent/current-version.txt
-
-      echo "Last tag: ${last_tag:-none}"
-      echo "Current version: $version"
+    run: bash ./.github/actions/cut-release/prepare-release-context.sh
 
 safe-outputs:
   report-failure-as-issue: false
@@ -112,108 +101,18 @@ jobs:
         id: release
         env:
           VERSION_BUMP: ${{ inputs.version-bump }}
-        run: |
-          set -euo pipefail
-
-          notes="/tmp/gh-aw/agent/release-notes.md"
-          if [ ! -f "$notes" ]; then
-            echo "::error::Agent did not write release-notes.md"
-            exit 1
-          fi
-
-          case "$VERSION_SOURCE" in
-            package-manifest) version=$(jq -r '.version // "0.0.0"' package.json 2>/dev/null || echo "0.0.0") ;;
-            git-tag) version=$(git describe --tags --abbrev=0 2>/dev/null || echo ""); version=${version#v}; version=${version:-0.0.0} ;;
-            python-project) version=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' pyproject.toml 2>/dev/null | head -1 || echo ""); version=${version:-0.0.0} ;;
-            none) version="0.0.0" ;;
-            *) echo "::error::Unknown version source: $VERSION_SOURCE"; exit 1 ;;
-          esac
-          current="$version"
-          echo "current_version=$current" >> "$GITHUB_OUTPUT"
-
-          # Determine the version bump
-          bump="$VERSION_BUMP"
-          if [ "$bump" = "auto" ]; then
-            if grep -qiE 'BREAKING CHANGE' "$notes" || grep -qE '\w+\(!:' /tmp/gh-aw/agent/git-log.txt; then
-              bump="major"
-            elif grep -qE '^feat(\(.+\))?:' /tmp/gh-aw/agent/git-log.txt; then
-              bump="minor"
-            else
-              bump="patch"
-            fi
-          fi
-
-          # Semver bump
-          IFS='.' read -r major minor patch <<< "$current"
-          case "$bump" in
-            major) major=$((major + 1)); minor=0; patch=0 ;;
-            minor) minor=$((minor + 1)); patch=0 ;;
-            patch) patch=$((patch + 1)) ;;
-            *) echo "::error::Unknown version-bump: $bump"; exit 1 ;;
-          esac
-          new_version="${major}.${minor}.${patch}"
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
-          echo "Determined version: $current -> $new_version (bump: $bump)"
-
-          # Copy notes to a clean location the release step can read
-          cp "$notes" /tmp/release-notes.md
+        run: bash ./.github/actions/cut-release/determine-version.sh
       - name: Write the new version to its source
         if: env.VERSION_SOURCE != 'none'
         env:
           NEW_VERSION: ${{ steps.release.outputs.new_version }}
-        run: |
-          set -euo pipefail
-          case "$VERSION_SOURCE" in
-            package-manifest)
-              for file in package.json cli/package.json; do
-                [ -f "$file" ] || continue
-                jq --arg v "$NEW_VERSION" '.version = $v' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
-                git add "$file"
-                echo "Bumped $file to $NEW_VERSION"
-              done
-              ;;
-            python-project)
-              sed -i "s/^version *= *\".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
-              git add pyproject.toml
-              echo "Bumped pyproject.toml to $NEW_VERSION"
-              ;;
-            git-tag)
-              echo "The tag is the version source; nothing to write."
-              ;;
-          esac
+        run: bash ./.github/actions/cut-release/write-version.sh
       - name: Commit, tag, and push
         if: env.VERSION_SOURCE != 'none'
         env:
           NEW_VERSION: ${{ steps.release.outputs.new_version }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git config user.name "$GIT_AUTHOR_NAME"
-          git config user.email "$GIT_AUTHOR_EMAIL"
-
-          # The checkout persists no credentials, so GH_TOKEN reaches `gh` and not git, and
-          # the push fails with "could not read Username" after the notes have been written.
-          # Carried per command through git's own environment rather than written into the
-          # remote URL, which .git/config would keep and every later step would inherit
-          # (FR-067).
-          host="${GITHUB_SERVER_URL#https://}"
-          git remote set-url origin "https://${host}/${GITHUB_REPOSITORY}.git"
-          GIT_CONFIG_COUNT=1
-          GIT_CONFIG_KEY_0=http.extraheader
-          GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
-          export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): v${NEW_VERSION}"
-            # The version commit lands on the default branch, which an adopter's rules may
-            # protect against exactly this. A refusal here is the forge working, and it says
-            # which rule it was; a repository whose version source is the tag stages nothing
-            # and never reaches this line.
-            git push
-          fi
-          git tag "v${NEW_VERSION}"
-          git push origin "v${NEW_VERSION}"
-          echo "Tagged v${NEW_VERSION} and pushed."
+        run: bash ./.github/actions/cut-release/commit-tag-push.sh
       - name: Create GitHub Release
         if: env.VERSION_SOURCE != 'none'
         env:

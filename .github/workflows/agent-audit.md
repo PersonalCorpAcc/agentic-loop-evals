@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-audit.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-audit.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   REPO_RULES: "Install with the lockfile frozen; an install that resolves a different tree is not reproducing the change under review. Run scripts through pnpm rather than npx, or a second package manager's lockfile appears in the diff."
   REPO_AUDIT_SKILL: repo-audit
@@ -28,8 +28,11 @@ name: "Agent: Audit"
 # Shared: network policy only. This workflow owns its Safe Outputs and OpenCode configuration.
 # permissions, engine, model and runs-on cannot be shared , see shared/platform-defaults.md.
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -48,8 +51,15 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
-model: claude-sonnet-5
+  id: opencode
+  version: "2.0.26"
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+
+model: openai/claude-sonnet-5
 
 max-turns: 300
 max-turn-cache-misses: 3000
@@ -86,6 +96,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # No apply-agent-output here. The safe_outputs job already created the issue and
       # exposes its number; calling the action with create-issues would file a second copy
       # of the same report. It was only needed while staged: true suppressed the native
@@ -110,6 +127,8 @@ jobs:
           subject: '-'
           detail: "${{ job.status == 'success' && 'The audit ran and its findings are on the audit issue.' || 'The audit conclusion did not finish; the step log says where it stopped.' }}"
 
+# Each run's OpenTelemetry GenAI spans -- duration, tokens, model, outcome; never prompt or
+# response content -- go to the profile's OTLP endpoint (feature 007 X14, FR-074).
 safe-outputs:
   # A failed run is already a red run. An issue per failure buries the real backlog
   # under noise nobody closes.
@@ -123,6 +142,10 @@ timeout-minutes: 45
 
 1. Call skill("${{ env.REPO_AUDIT_SKILL }}"), then run `/${{ env.REPO_AUDIT_COMMAND }}` as a read-only audit of this
    repository. Do not modify any file, do not commit, and do not push.
+
+   The agent kit's skills are files at `.agents/skills/<name>/SKILL.md` and its commands at
+   `.opencode/commands/<name>.md`. Where your tools have no skill or command by that name, read
+   that file and follow it; it is the same instruction. Do not stop or search for it elsewhere.
 
   2. Apply repository documentation and established conventions while auditing. Focus on
      concrete defects and avoid recommendations that weaken security, tests, or checks.

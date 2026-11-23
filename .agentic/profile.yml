@@ -6,8 +6,13 @@ runners:
   agent: [ubuntu-24.04]
   slim: [ubuntu-24.04]
   ci: [ubuntu-24.04]
+# The opencode engine through an OpenAI-compatible endpoint (feature 007 T113, 23/11/2026):
+# Anthropic's compatibility endpoint stands in for a customer's gateway, so gh-aw v1.3.1's
+# OpenCode v2 runs the path a gateway customer would.
 llm:
-  engine: claude
+  engine: opencode
+  provider: anthropic-compat
+  baseUrl: https://api.anthropic.com/v1
   model: claude-sonnet-5
   secret: ANTHROPIC_API_KEY
 bot:

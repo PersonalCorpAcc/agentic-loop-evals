@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/validate-review-output/validate-review-output.sh. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/validate-review-output/validate-review-output.sh. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 # Print implemented, already-satisfied, needs-human, or invalid.
 
 set -euo pipefail
@@ -25,7 +25,8 @@ jq -r --arg pr "$pr_number" --slurpfile threads "$threads_file" '
   # `scan` without captures emits one string per match and `map` collects every output, so
   # this is already a flat array: `add` would concatenate the ids into a single string, and
   # `unique` on a string is an error rather than a verdict.
-  | ([$comments[].body | scan("PRRT_[A-Za-z0-9_=-]+")] | unique | sort) as $reported
+  # A thread is `PRRT_`, and a change request made as a review body is the review, `PRR_` (FR-118).
+  | ([$comments[].body | scan("PRRT?_[A-Za-z0-9_=-]+")] | unique | sort) as $reported
   | ([$items[] | select(.type == "push_to_pull_request_branch")] | length) as $pushes
   | if $expected != $reported then "invalid"
     elif $outcome == "implemented" and $pushes == 1 then "implemented"

@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-merge-gate.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-merge-gate.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   VERIFY_COMMANDS: "pnpm install --frozen-lockfile && pnpm run build && pnpm run test"
   REPO_RULES: "Install with the lockfile frozen; an install that resolves a different tree is not reproducing the change under review. Run scripts through pnpm rather than npx, or a second package manager's lockfile appears in the diff."
@@ -36,6 +36,17 @@ env:
   AUTO_MERGE_MODE: "off"
   AUTO_MERGE_TARGETS: ""
   GATE_MARKER: "<!-- agent-merge-gate -->"
+  # Whether a person's pull request is assessed too, advise-only: one comment carrying
+  # `<!-- agent-merge-gate-advisory: <verdict> -->` and the findings, and nothing else -- no
+  # label, push, merge or approval (feature 007 X11, FR-027). Off unless a profile turns it on.
+  SHADOW_HUMAN_PULL_REQUESTS: "false"
+  # What the gate does with a change that needs work (feature 007 X08, FR-024). `fix`: it fixes a
+  # failed CI run or a conflict itself and pushes. `review`: it never pushes; it requests the
+  # changes as a pull-request review with severity-ranked findings, apply-review makes them, and
+  # the gate reviews again on the next CI run. The marker is how apply-review and the next gate
+  # run tell the gate's own change request from a person's.
+  GATE_MODE: "fix"
+  GATE_REVIEW_MARKER: "<!-- agent-merge-gate-review -->"
   ATTEMPT_MARKER: "<!-- agent-merge-gate-attempt -->"
   MAX_ATTEMPTS: "6"
   PARK_AT_ATTEMPT: "5"
@@ -54,13 +65,21 @@ description: |
   The router supplies the CI conclusion and run ID as facts, so there is no polling and no
   timeout branch. The conclusion is read from the inputs instead of filtered at the trigger.
 
+  Two profile choices (feature 007): `gate.mode: review` makes it a reviewer that never pushes --
+  severity-ranked findings become a change request apply-review answers, and the gate reviews
+  again (X08, FR-024); `gate.shadowHumanPullRequests` has it advise, without changing anything,
+  on pull requests people open (X11, FR-027).
+
 name: "Agent: Merge Gate"
 
 # Router-only worker. The Work Router owns triggers, classification, and rung 1-2 checks.
 # This workflow receives the classified inputs and runs rung 3+.
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -85,6 +104,14 @@ on:
         required: false
         type: string
         default: '0'
+      human-only:
+        description: >-
+          'true' when the router sent this run for a person's pull request only (the green-CI
+          shadow route, FR-027). A bot pull request is then refused: its verdict reaches the
+          gate through CI's own dispatch.
+        required: false
+        type: string
+        default: 'false'
   # gh-aw folds the top-level `if:` below into the generated activation job but does not carry
   # the jobs that `if:` reads into activation's `needs`: only prompt-referenced custom jobs with
   # no `needs:` of their own are hoisted (subject). protected_changes needs subject, so without
@@ -143,6 +170,13 @@ jobs:
       # agent is asked for is policy, and policy belongs in a deterministic job.
       verdict_word: ${{ steps.policy.outputs.verdict_word }}
       verdict_sentence: ${{ steps.policy.outputs.verdict_sentence }}
+      # A person's pull request assessed in shadow (feature 007 X11, FR-027): every job that
+      # writes asks this first, and the prompt is told so in `advise_note`.
+      advise: ${{ steps.subject.outputs.advise }}
+      advise_note: ${{ steps.phrasing.outputs.advise_note }}
+      # What review mode asks of the agent instead of a fix; empty under `fix` (FR-024).
+      mode_note: ${{ steps.phrasing.outputs.mode_note }}
+      checked_note: ${{ steps.phrasing.outputs.checked_note }}
     steps:
       - name: Checkout workflow actions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,6 +195,8 @@ jobs:
           linked-issue: ${{ inputs.linked-issue }}
           require-label: ${{ env.IMPLEMENT_LABEL }}
           stage-labels: ${{ env.STAGE_LABELS }}
+          shadow-human-pull-requests: ${{ env.SHADOW_HUMAN_PULL_REQUESTS }}
+          human-only: ${{ inputs.human-only || 'false' }}
       # Answered here, beside the base it depends on, because three readers need the same
       # answer: the prompt, which must not ask the agent for a verdict this repository will
       # not act on; the merge step; and the outcome line. Three derivations of one policy
@@ -171,66 +207,33 @@ jobs:
           BASE: ${{ steps.subject.outputs.base }}
           AUTO_MERGE_MODE: ${{ env.AUTO_MERGE_MODE }}
           AUTO_MERGE_TARGETS: ${{ env.AUTO_MERGE_TARGETS }}
-        run: |
-          set -euo pipefail
-          auto_merge=false
-          if [ "${AUTO_MERGE_MODE:-off}" != "off" ] && [ -n "${BASE:-}" ]; then
-            while IFS= read -r target; do
-              [ "$target" = "$BASE" ] || continue
-              auto_merge=true
-              break
-            done < <(printf '%s\n' "${AUTO_MERGE_TARGETS:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-          fi
-          echo "auto_merge=$auto_merge" >> "$GITHUB_OUTPUT"
-          if [ "$auto_merge" = true ]; then
-            echo "verdict_word=merge" >> "$GITHUB_OUTPUT"
-            echo "verdict_sentence=this pull request merges itself when you say merge" >> "$GITHUB_OUTPUT"
-            echo "This repository merges into ${BASE} unattended (${AUTO_MERGE_MODE}); a clean assessment merges."
-          else
-            echo "verdict_word=approve" >> "$GITHUB_OUTPUT"
-            echo "verdict_sentence=a person merges this pull request; say approve" >> "$GITHUB_OUTPUT"
-            echo "This repository does not merge into ${BASE:-?} unattended; a clean assessment is an approval and a person merges."
-          fi
+          ADVISE: ${{ steps.subject.outputs.advise }}
+        run: bash ./.github/actions/merge-gate/decide-auto-merge.sh
       - name: Block a pull request with requested changes
         id: review
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.subject.outputs.pr }}
-        run: |
-          set -euo pipefail
-          # A transient API failure must not kill the gate (the reconcile cron can push the
-          # token into secondary rate limits). Three tries, then default to not blocked; the
-          # agent re-reads the review state itself before any merge.
-          decision=""
-          for _ in 1 2 3; do
-            if decision=$(gh pr view "$PR" --repo "$REPO" --json reviewDecision --jq '.reviewDecision // ""'); then
-              break
-            fi
-            sleep 5
-          done
-          echo "review_blocked=$([ "$decision" = 'CHANGES_REQUESTED' ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          GATE_REVIEW_MARKER: ${{ env.GATE_REVIEW_MARKER }}
+        # A person's change request holds the pull request; the gate's own, made in review mode
+        # for apply-review to answer, does not (feature 007 X08). A transient API failure must
+        # not kill the gate: three tries, then not blocked, as before.
+        run: bash ./.github/actions/gate-review/review-blocked.sh
       - name: Say what this run is assessing
         id: phrasing
         env:
           PROMOTION: ${{ steps.subject.outputs.promotion }}
+          ADVISE: ${{ steps.subject.outputs.advise }}
+          PR: ${{ steps.subject.outputs.pr }}
+          ISSUE: ${{ steps.subject.outputs.issue }}
           ISSUE_CONTEXT_PATH: ${{ env.ISSUE_CONTEXT_PATH }}
           VERIFY_COMMAND: ${{ env.REPO_VERIFY_COMMAND }}
-        run: |
-          set -euo pipefail
-          if [ "${PROMOTION:-false}" = true ]; then
-            echo "subject_clause=promotes a set of changes, one of which is issue" >> "$GITHUB_OUTPUT"
-            {
-              echo "promotion_note<<EOF_NOTE"
-              echo "This is a **promotion**. Its head is a snapshot of the stage below, so it carries several changes, each of which already passed this gate on its way to that stage; its body names every issue it carries. You are not re-assessing them one by one. What you are assessing is the promotion itself: that CI is green on the combination, that nothing in the diff is a file this repository protects, and that the set is what the body says it is. Post your assessment on this pull request, and do not touch any issue."
-              echo "EOF_NOTE"
-            } >> "$GITHUB_OUTPUT"
-            echo "context_instruction=There is no issue context on a promotion: it carries several issues, and any one of their acceptance criteria would be the wrong measure for the rest. The diff and the CI conclusion are what you have, and they are what a promotion is assessed on." >> "$GITHUB_OUTPUT"
-          else
-            echo "subject_clause=closes issue" >> "$GITHUB_OUTPUT"
-            echo "promotion_note=" >> "$GITHUB_OUTPUT"
-            echo "context_instruction=Read \`${ISSUE_CONTEXT_PATH}\`. It contains the issue body and its discussion. When running \`/${VERIFY_COMMAND}\`, the acceptance criteria there define what the implementation must satisfy." >> "$GITHUB_OUTPUT"
-          fi
+          IMPLEMENT_LABEL: ${{ env.IMPLEMENT_LABEL }}
+          GATE_MODE: ${{ env.GATE_MODE }}
+          BASE: ${{ steps.subject.outputs.base }}
+          VERDICT_WORD: ${{ steps.policy.outputs.verdict_word }}
+        run: bash ./.github/actions/merge-gate/phrase-assessment.sh
       - name: Record the outcome
         if: always()
         uses: ./.github/actions/record-outcome
@@ -341,41 +344,7 @@ jobs:
           # Composed by the installer from the engine baseline, the declared packs'
           # manifests and lockfiles, and the profile's documents (FR-022).
           PROTECTED_FILES: ${{ env.PROTECTED_FILES }}
-        run: |
-          set -euo pipefail
-          # Compared against the merge base as it is now, rather than read from the pull
-          # request's own file list (FR-083).
-          #
-          # A pull request keeps the base it was opened against. When the base branch's
-          # history moves -- a back-merge, a realignment, anything that is not a fast-forward
-          # of what it had -- `pulls/{n}/files` goes on answering from the old merge base,
-          # for ever: on the canary on 18/09/2026 it reported 83 changed files where git said
-          # two, and neither a `synchronize` event nor twenty minutes shifted it. This rule
-          # decides whether a person must look at a change, so reading a stale list means
-          # handing over work nobody needed to do -- and, in the other direction, a rule that
-          # is wrong in one direction is not one anybody should trust in the other.
-          #
-          # The three-dot compare is computed when it is asked for, so it cannot go stale.
-          head_sha=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-          # Kept whole for the test-integrity check, which reads each file's status and patch.
-          compare_file="$RUNNER_TEMP/compare.json"
-          gh api "repos/$REPO/compare/${BASE}...${head_sha}" > "$compare_file" || true
-          files=$(jq -r '.files[]?.filename' "$compare_file" 2>/dev/null || true)
-          # The compare endpoint stops at 300 files and says so by giving exactly that many.
-          # Past it the pull request's own list is the only one available, stale or not, and a
-          # change that large is one a person should see anyway.
-          if [ "$(printf '%s\n' "$files" | grep -c .)" -ge 300 ]; then
-            echo "::warning::PR #${PR} changes 300 files or more, which is the compare limit; falling back to the pull request's own file list."
-            gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" | jq -s 'add' > "$compare_file"
-            files=$(jq -r '.[].filename' "$compare_file")
-          fi
-          echo "compare_file=$compare_file" >> "$GITHUB_OUTPUT"
-          protected=$(printf '%s\n' "$files" | grep -E "$PROTECTED_FILES" || true)
-          {
-            echo 'files<<EOF'
-            printf '%s\n' "$protected"
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
+        run: bash ./.github/actions/merge-gate/list-protected-changes.sh
       # A change that deletes a test, renames one away or adds a skip marker hands the pull
       # request to a person, as a protected file does: the agent must not be able to make a
       # failing test disappear (007 X06). Decided here, deterministically, not by the model.
@@ -391,20 +360,7 @@ jobs:
         env:
           PROTECTED: ${{ steps.protected.outputs.files }}
           FINDINGS: ${{ steps.integrity.outputs.findings }}
-        run: |
-          set -euo pipefail
-          listed=$(printf '%s\n%s\n' "$PROTECTED" "$FINDINGS" | grep -v '^$' || true)
-          if [ -n "$listed" ]; then
-            echo "requires_review=true" >> "$GITHUB_OUTPUT"
-            {
-              echo 'files<<EOF'
-              printf '%s\n' "$listed"
-              echo EOF
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "requires_review=false" >> "$GITHUB_OUTPUT"
-            echo "files=" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash ./.github/actions/merge-gate/decide-person-review.sh
 
   review_required:
     needs: [subject, protected_changes]
@@ -417,37 +373,44 @@ jobs:
       issues: write
     steps:
       - name: Checkout workflow actions
-        if: (needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure') || needs.subject.outputs.review_blocked == 'true'
+        if: needs.subject.outputs.advise != 'true' && ((needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure') || needs.subject.outputs.review_blocked == 'true')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Create bot token
-        if: needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure'
+        if: needs.subject.outputs.advise != 'true' && needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure'
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # Only the reservation comes off. pr-pending says a pull request for this issue is open
       # and waiting, which is still true when the gate hands it to a human, so taking it off
       # here left a board where three issues with three open pull requests looked like they
       # had none. The merge path is the one place the label stops being true.
       - name: Release the issue
-        if: needs.subject.outputs.promotion != 'true' && (needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure')
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.promotion != 'true' && (needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure')
         uses: ./.github/actions/remove-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.issue }}
           labels: ${{ env.WORKING_LABEL }}
       - name: Flag human review
-        if: needs.subject.outputs.promotion != 'true' && (needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure')
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.promotion != 'true' && (needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure')
         uses: ./.github/actions/add-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.issue }}
           labels: ${{ env.REVIEW_LABEL }}
       - name: Explain the merge hold
-        if: needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure'
+        if: needs.subject.outputs.advise != 'true' && needs.protected_changes.outputs.requires_review == 'true' && needs.subject.outputs.conclusion != 'failure'
         uses: ./.github/actions/create-issue-comment
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -464,7 +427,7 @@ jobs:
       # The loop is waiting for a person, which is a state, not a failure. Recorded where
       # every other verdict is recorded, so the run reads the same way as any other (T246).
       - name: Say that a reviewer has this pull request
-        if: needs.subject.outputs.review_blocked == 'true'
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.review_blocked == 'true'
         uses: ./.github/actions/record-outcome
         with:
           outcome: handed-to-human
@@ -495,33 +458,20 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Check for merge conflicts
         id: conflicts
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR: ${{ needs.subject.outputs.pr }}
-        run: |
-          set -euo pipefail
-          # GitHub computes mergeability lazily and answers UNKNOWN to the first question after
-          # the base moves, which read as "no conflict": on loopscope (20/11/2026) the gate saw a
-          # DIRTY pull request as mergeable, found no CI result, and asked for review instead of
-          # resolving the conflict (FR-108). Ask until it knows, and take a DIRTY merge state as
-          # a conflict too.
-          mergeable=UNKNOWN
-          state=""
-          for _ in 1 2 3 4 5 6 7 8; do
-            read -r mergeable state < <(gh pr view "$PR" --repo "$REPO" --json mergeable,mergeStateStatus \
-              --jq '"\(.mergeable) \(.mergeStateStatus)"' 2>/dev/null || echo "UNKNOWN UNKNOWN")
-            [ "$mergeable" = "UNKNOWN" ] || break
-            sleep 5
-          done
-          echo "PR #$PR: mergeable=$mergeable, merge state=$state"
-          if [ "$mergeable" = "CONFLICTING" ] || [ "$state" = "DIRTY" ]; then
-            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash ./.github/actions/merge-gate/check-merge-conflicts.sh
       # First attempt only. Retries are recorded by the incomplete job's attempt comment, and
       # every App comment is a router event: one issue collected sixteen of these in a day.
       # Under `human` the agent never sees the conflict: it is told nothing, runs nothing,
@@ -537,14 +487,14 @@ jobs:
           echo "blocked=true" >> "$GITHUB_OUTPUT"
           echo "PR #${{ needs.subject.outputs.pr }} conflicts and this repository resolves conflicts by ${CONFLICT_RESOLUTION}; the agent will not be started."
       - name: Hand the conflict to a human
-        if: needs.subject.outputs.promotion != 'true' && (steps.conflict-mode.outputs.blocked == 'true')
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.promotion != 'true' && (steps.conflict-mode.outputs.blocked == 'true')
         uses: ./.github/actions/add-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.issue }}
           labels: ${{ env.REVIEW_LABEL }}
       - name: Say why the conflict was not resolved
-        if: steps.conflict-mode.outputs.blocked == 'true'
+        if: needs.subject.outputs.advise != 'true' && steps.conflict-mode.outputs.blocked == 'true'
         uses: ./.github/actions/create-issue-comment
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -558,14 +508,14 @@ jobs:
 
             **Verdict:** review
       - name: Comment on issue - problems found, solving them
-        if: needs.subject.outputs.conclusion == 'failure' && (inputs.attempts_so_far || '0') == '0'
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.conclusion == 'failure' && (inputs.attempts_so_far || '0') == '0'
         uses: ./.github/actions/create-issue-comment
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.comment_target }}
           body: |
             Problems found in PR #${{ needs.subject.outputs.pr }}. ${{ steps.conflicts.outputs.has_conflicts == 'true' && 'Merge conflicts detected.' || 'CI failed.' }}
-            Bot is working on fixing it.
+            ${{ env.GATE_MODE == 'review' && 'The merge gate is reviewing it and will request the changes it needs.' || 'Bot is working on fixing it.' }}
   validate_output:
     needs: [activation, subject, reserve, agent, safe_outputs]
     if: >
@@ -575,9 +525,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # Review mode counts the change requests the gate has already made (FR-024).
+      pull-requests: read
     outputs:
-      valid: ${{ steps.validate.outputs.valid }}
-      outcome: ${{ steps.validate.outputs.outcome }}
+      # Review mode's decision where there is one, the validator's otherwise: the review step is
+      # installed only under `gate.mode: review` (feature 007 X08).
+      valid: ${{ steps.decide.outputs.valid || steps.validate.outputs.valid }}
+      outcome: ${{ steps.decide.outputs.outcome || steps.validate.outputs.outcome }}
+      round: ${{ steps.decide.outputs.round }}
     steps:
       - name: Checkout workflow actions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -601,9 +556,33 @@ jobs:
           # Step 4b pushes a merge of the base on green CI and says `remediated`; the validator
           # accepts that only when the gate saw a conflict (review WF-04).
           has-conflicts: ${{ needs.reserve.outputs.has_conflicts || 'false' }}
+          # A verdict addressed to the pull request is the same answer on the wrong page;
+          # conclude posts it on comment_target either way.
+          pr-number: ${{ needs.subject.outputs.pr }}
+          # Under review the gate never pushes and `changes` is its request for changes.
+          gate-mode: ${{ needs.subject.outputs.advise == 'true' && 'fix' || env.GATE_MODE }}
+      # Only blockers and majors request changes, a promotion is not changed by apply-review, and
+      # the rounds are capped at the attempt budget's park point (feature 007 X08, FR-024).
+      # Installed in every mode and skipped outside review: other steps read its outputs, and a
+      # step projected away leaves those references pointing at nothing, which actionlint rejects.
+      - name: Decide the review-mode verdict
+        id: decide
+        if: env.GATE_MODE == 'review' && needs.subject.outputs.advise != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.subject.outputs.pr }}
+          COMMENT_TARGET: ${{ needs.subject.outputs.comment_target }}
+          PROMOTION: ${{ needs.subject.outputs.promotion }}
+          OUTCOME: ${{ steps.validate.outputs.outcome }}
+          OUTPUT_FILE: ${{ steps.output.outputs.output-file }}
+          MAX_ROUNDS: ${{ env.PARK_AT_ATTEMPT }}
+          GATE_REVIEW_MARKER: ${{ env.GATE_REVIEW_MARKER }}
+        run: bash ./.github/actions/gate-review/decide-review-outcome.sh
   conclude:
     needs: [activation, subject, protected_changes, agent, safe_outputs, validate_output]
     if: >
+       needs.subject.outputs.advise != 'true' &&
        needs.agent.result == 'success' &&
         needs.safe_outputs.result == 'success' &&
         needs.validate_output.outputs.valid == 'true' &&
@@ -620,6 +599,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -644,6 +630,9 @@ jobs:
           push-to-branch: 'true'
           pr-number: ${{ needs.subject.outputs.pr }}
           apply-labels: 'false'
+          # The assessment has one right place. `add-comment` is `target: "*"`, so the agent
+          # picks the number, and picking the pull request it is gating is a natural slip.
+          comment-target: ${{ needs.subject.outputs.comment_target }}
       # GITHUB_TOKEN on purpose: an App-token comment on a pull request is an issue_comment
       # event, and GITHUB_TOKEN raises none. The full assessment lives on the issue, where the
       # lifecycle is; this is what a reviewer opening the pull request sees. Carrying the
@@ -658,6 +647,29 @@ jobs:
             ${{ env.GATE_MARKER }}
             **Verdict:** ${{ needs.validate_output.outputs.outcome }} (CI concluded ${{ needs.subject.outputs.conclusion }}).
             Full assessment: ${{ needs.subject.outputs.promotion == 'true' && 'above, on this pull request' || format('on the linked issue #{0}', needs.subject.outputs.issue) }}. [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+      # Review mode (feature 007 X08, FR-024). The findings go to the pull request as a change
+      # request, with the App token so the review is an event: the router sends it to
+      # apply-review, which makes the change. A forge that refuses the review -- the App may not
+      # review a pull request it opened itself -- hands the change to a person instead.
+      - name: Request the changes as a review
+        id: request
+        if: env.GATE_MODE == 'review' && needs.validate_output.outputs.outcome == 'changes'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.subject.outputs.pr }}
+          COMMENT_TARGET: ${{ needs.subject.outputs.comment_target }}
+          OUTPUT_FILE: ${{ github.workspace }}/agent-artifact/agent_output.json
+          GATE_REVIEW_MARKER: ${{ env.GATE_REVIEW_MARKER }}
+          ROUND: ${{ needs.validate_output.outputs.round }}
+          MAX_ROUNDS: ${{ env.PARK_AT_ATTEMPT }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash ./.github/actions/gate-review/post-gate-review.sh
+      # The reservation comes off either way: apply-review reserves the issue for itself, and a
+      # refused review is a person's.
+      # Clean: the gate's own change requests are done with. Dismissed before anything merges,
+      # never approved over -- an App approval could count towards a rule that wants a person's.
       # The forge is asked before anything is attempted: a pull request it will refuse is a
       # review with a sentence, not a red run that says neither which pull request nor what
       # to do about it (FR-068).
@@ -673,16 +685,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR: ${{ needs.subject.outputs.pr }}
-        run: |
-          set -euo pipefail
-          offenders="$(gh api "repos/${REPO}/pulls/${PR}/commits" --paginate \
-            --jq '.[] | select(.commit.message | test("(^|[^a-zA-Z])(close[sd]?|fixe?[sd]?|resolve[sd]?)[ :]*#[0-9]+"; "i")) | .sha[0:8] + " " + (.commit.message | split("\n")[0])')"
-          [ -z "$offenders" ] || {
-            echo "::error::PR #${PR} merges by rebase and these commits carry a closing keyword, which would close the issue at the first stage they land on:"
-            printf '%s\n' "$offenders" >&2
-            exit 1
-          }
-          echo "No commit on PR #${PR} closes an issue by keyword."
+        run: bash ./.github/actions/merge-gate/refuse-closing-commits.sh
       - name: Check the forge will take the merge
         id: preconditions
         if: needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true'
@@ -721,32 +724,7 @@ jobs:
           PR: ${{ needs.subject.outputs.pr }}
           MERGE_METHOD: ${{ env.MERGE_METHOD }}
           REFUSAL: ${{ steps.preconditions.outputs.refusal }}
-        run: |
-          set -euo pipefail
-          # The method is the profile's, chosen here rather than at merge time because with
-          # auto-merge the forge performs the merge later and takes the method now.
-          if armed="$(gh pr merge "$PR" --repo "$REPO" "--${MERGE_METHOD}" --auto 2>&1)"; then
-            echo "armed=true" >> "$GITHUB_OUTPUT"
-            gh pr comment "$PR" --repo "$REPO" --body "The merge gate found nothing to stop this pull request and has marked it ready: ${REFUSAL}
-
-            Nothing else is needed from the loop. Nothing about the issue has changed -- it is still reserved and still pending."
-            echo "PR #${PR}: auto-merge armed (${MERGE_METHOD}); waiting for the rule to be satisfied."
-          else
-            # The forge's own sentence, carried rather than guessed. There are at least two
-            # causes and they want different remedies: `Auto merge is not allowed for this
-            # repository` is the setting, off by default, and `Merge method rebase merging is
-            # not allowed` is the profile's merge method against what the repository or a
-            # ruleset permits -- observed 18/09/2026. Both refuse at once rather than
-            # accepting and never completing, which is the good outcome; what would make it
-            # expensive is a message that sent the reader to the wrong switch.
-            echo "armed=false" >> "$GITHUB_OUTPUT"
-            {
-              echo 'arm_error<<GHAWEOF'
-              printf '%s\n' "$armed" | head -n 3
-              echo GHAWEOF
-            } >> "$GITHUB_OUTPUT"
-            echo "::warning::PR #${PR}: auto-merge could not be armed. ${armed}"
-          fi
+        run: bash ./.github/actions/merge-gate/arm-auto-merge.sh
       - name: Hand the merge to a human when the forge refuses it
         if: needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true' && steps.preconditions.outputs.mergeable != 'true' && (steps.preconditions.outputs.deferrable != 'true' || steps.arm.outputs.armed != 'true')
         env:
@@ -757,19 +735,7 @@ jobs:
           ARMED: ${{ steps.arm.outputs.armed }}
           ARM_ERROR: ${{ steps.arm.outputs.arm_error }}
           DEFERRABLE: ${{ steps.preconditions.outputs.deferrable }}
-        run: |
-          set -euo pipefail
-          if [ "$DEFERRABLE" = "true" ] && [ "$ARMED" != "true" ]; then
-            gh pr comment "$PR" --repo "$REPO" --body "The merge gate approved this pull request but could not merge or queue it: ${REFUSAL}
-
-            It could not be marked ready either. The forge said:
-
-            > ${ARM_ERROR:-no reason given}
-
-            Two things cause that. **Allow auto-merge** may be switched off for this repository, which is its default. Or the merge method this loop is configured for may not be one the repository or its rulesets permit, in which case the two settings disagree and one of them has to move. Either way this pull request waits for a person."
-          else
-            gh pr comment "$PR" --repo "$REPO" --body "The merge gate approved this pull request but did not merge it: ${REFUSAL}"
-          fi
+        run: bash ./.github/actions/merge-gate/explain-refused-merge.sh
       - name: Flag the refused merge for review
         if: needs.subject.outputs.promotion != 'true' && (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true' && steps.preconditions.outputs.mergeable != 'true' && (steps.preconditions.outputs.deferrable != 'true' || steps.arm.outputs.armed != 'true'))
         uses: ./.github/actions/add-issue-labels
@@ -822,13 +788,13 @@ jobs:
         if: always()
         uses: ./.github/actions/record-outcome
         with:
-          outcome: ${{ (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'acted' || needs.validate_output.outputs.outcome == 'review' && 'handed-to-human' || needs.validate_output.outputs.outcome == 'invalid' && 'no-action' || 'acted' }}
-          reason: ${{ steps.arm.outputs.armed == 'true' && 'merge-armed' || (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'merged' || needs.validate_output.outputs.outcome == 'review' && 'review-requested' || needs.validate_output.outputs.outcome == 'remediated' && 'acted' || needs.validate_output.outputs.outcome == 'invalid' && 'nothing-to-sweep' || 'approved' }}
+          outcome: ${{ (needs.validate_output.outputs.outcome == 'changes' && steps.request.outcome == 'failure') && 'handed-to-human' || (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'acted' || needs.validate_output.outputs.outcome == 'review' && 'handed-to-human' || needs.validate_output.outputs.outcome == 'invalid' && 'no-action' || 'acted' }}
+          reason: ${{ (needs.validate_output.outputs.outcome == 'changes' && steps.request.outcome == 'failure') && 'review-requested' || needs.validate_output.outputs.outcome == 'changes' && 'changes-requested' || steps.arm.outputs.armed == 'true' && 'merge-armed' || (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'merged' || needs.validate_output.outputs.outcome == 'review' && 'review-requested' || needs.validate_output.outputs.outcome == 'remediated' && 'acted' || needs.validate_output.outputs.outcome == 'invalid' && 'nothing-to-sweep' || 'approved' }}
           route: merge-gate
           subject: ${{ needs.subject.outputs.pr && format('#{0}', needs.subject.outputs.pr) || '-' }}
-          detail: "${{ steps.arm.outputs.armed == 'true' && 'The pull request is marked ready; the forge merges it when the rule holding it is satisfied.' || (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'The pull request was merged.' || needs.validate_output.outputs.outcome == 'review' && 'The gate asked for a human; the assessment is on the issue.' || needs.validate_output.outputs.outcome == 'invalid' && 'The gate reached no verdict on this run.' || 'The gate approved the pull request; this repository does not merge into that branch unattended, so it waits for a person.' }}"
+          detail: "${{ (needs.validate_output.outputs.outcome == 'changes' && steps.request.outcome == 'failure') && 'The gate asked for changes and the forge refused its review, so a person has the change.' || needs.validate_output.outputs.outcome == 'changes' && 'The gate requested changes as a review; apply-review makes them and the gate reviews again.' || steps.arm.outputs.armed == 'true' && 'The pull request is marked ready; the forge merges it when the rule holding it is satisfied.' || (needs.validate_output.outputs.outcome == 'merge' && needs.subject.outputs.auto_merge == 'true') && 'The pull request was merged.' || needs.validate_output.outputs.outcome == 'review' && 'The gate asked for a human; the assessment is on the issue.' || needs.validate_output.outputs.outcome == 'invalid' && 'The gate reached no verdict on this run.' || 'The gate approved the pull request; this repository does not merge into that branch unattended, so it waits for a person.' }}"
   incomplete:
-    needs: [subject, protected_changes, agent, safe_outputs, validate_output]
+    needs: [activation, subject, protected_changes, agent, safe_outputs, validate_output]
     # A pull request a reviewer has asked to change is not an incomplete run: the agent was
     # never meant to start. Saying so here would be four "ended without an outcome" comments
     # in four minutes, one per CI event, with an attempt counter that stays at 0 because the
@@ -837,6 +803,7 @@ jobs:
     if: >
        always() &&
        needs.subject.outputs.found == 'true' &&
+       needs.subject.outputs.advise != 'true' &&
        needs.subject.outputs.review_blocked != 'true' &&
        (needs.protected_changes.outputs.requires_review != 'true' || needs.subject.outputs.conclusion == 'failure') &&
        (
@@ -859,6 +826,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       # The attempt record comes first. The belt bounds its retries by counting attempt comments
       # newer than the CI verdict, not by labels; releasing the labels before the record existed
       # meant a failure in either step below un-reserved the issue with nothing to count, and the
@@ -877,6 +851,7 @@ jobs:
           body: |
             ${{ env.ATTEMPT_MARKER }}
             Attempt ${{ inputs.attempts_so_far || '0' }} of ${{ env.MAX_ATTEMPTS }} on PR #${{ needs.subject.outputs.pr }} ended without an outcome.
+            ${{ needs.activation.outputs.daily_ai_credits_exceeded == 'true' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it). Work resumes once the day''s usage is back under it; raise the variable to allow more.', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || '' }}
             The issue keeps `implement`; the merge belt will retry.
             [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
       - name: Report the exhausted attempt budget
@@ -888,6 +863,7 @@ jobs:
           body: |
             ${{ env.ATTEMPT_MARKER }}
             Attempt ${{ inputs.attempts_so_far || '0' }} of ${{ env.MAX_ATTEMPTS }} on PR #${{ needs.subject.outputs.pr }} ended without an outcome.
+            ${{ needs.activation.outputs.daily_ai_credits_exceeded == 'true' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it). Work resumes once the day''s usage is back under it; raise the variable to allow more.', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || '' }}
             The attempt budget for this CI verdict is exhausted. The review label is set: a human must take over.
             [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
       - name: Park the issue for a human
@@ -900,13 +876,21 @@ jobs:
       # The reservation only. A failed attempt does not close the pull request, so pr-pending
       # is still true and the board should keep saying so.
       - name: Release the issue
-        if: needs.subject.outputs.promotion != 'true'
+        if: needs.subject.outputs.advise != 'true' && needs.subject.outputs.promotion != 'true'
         uses: ./.github/actions/remove-issue-labels
         with:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.issue }}
           labels: ${{ env.WORKING_LABEL }}
 
+  # Shadow mode's only write (feature 007 X11, FR-027). A person's pull request gets one
+  # comment: the verdict in a marker the comparison reads, `<!-- agent-merge-gate-advisory:
+  # <verdict> -->`, and the findings. Its own job rather than a path through conclude, so the
+  # jobs that label, merge and push keep one shape and each of them simply does not run here.
+  # The workflow token, so the comment raises no event. The verdict is the rule's where a rule
+  # decides without the agent (a protected file, a change request, a conflict handed to a
+  # person), and the agent's otherwise; a verdict the agent could not give is recorded, not
+  # posted.
   agent:
     # The top-level guard reads both outputs. GitHub Actions does not make a
     # dependency's dependencies available through `needs` transitively.
@@ -919,14 +903,21 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
+  id: opencode
+  version: "2.0.26"
   # The agent job's own concurrency group, per pull request. The compiler's default is one group per
   # workflow, which serialised this worker across the whole repository whatever the router
   # allowed; the router's caller job owns the real limit (review WF-06).
   concurrency:
     group: "gh-aw-merge-gate-${{ inputs.pr-number }}"
     cancel-in-progress: false
-model: claude-sonnet-5
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+
+model: openai/claude-sonnet-5
 
 max-turns: 300
 max-turn-cache-misses: 3000
@@ -962,7 +953,7 @@ steps:
   # the first of several would be a context that is wrong about the rest. What it is assessed
   # against is the diff and CI, which the next step fetches (FR-056).
   - name: Load the issue context
-    if: needs.subject.outputs.promotion != 'true'
+    if: needs.subject.outputs.promotion != 'true' && needs.subject.outputs.issue != ''
     uses: ./.github/actions/load-issue-context
     with:
       token: ${{ github.token }}
@@ -975,41 +966,10 @@ steps:
       PR: ${{ needs.subject.outputs.pr }}
       RUN_ID: ${{ needs.subject.outputs.run-id }}
       CONCLUSION: ${{ needs.subject.outputs.conclusion }}
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent
-      gh pr diff "$PR" --repo "$REPO" > /tmp/gh-aw/agent/diff.patch
-      gh pr view "$PR" --repo "$REPO" --json title,body,files,additions,deletions \
-        > /tmp/gh-aw/agent/pr.json
+    run: bash ./.github/actions/merge-gate/fetch-gate-context.sh
 
-      # What this working tree is not. The agent is on the head branch; CI ran on the merge of
-      # head and base. Everything the base supplies -- a dependency, a tsconfig path, a
-      # generated file -- is absent here, so a build run in this tree can fail for reasons that
-      # do not exist in what will land. Recorded rather than inferred, because the agent cannot
-      # see it and has already argued itself past a green CI run without it (PR #55).
-      base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq '.baseRefName')
-      git fetch -q origin "$base" 2>/dev/null || true
-      behind=$(git rev-list --count "HEAD..origin/$base" 2>/dev/null || echo "unknown")
-      {
-        echo "base branch: $base"
-        echo "commits on the base that this branch does not have: $behind"
-        if [ "$behind" != "unknown" ] && [ "$behind" != "0" ]; then
-          echo "files those commits touch:"
-          git diff --name-only "HEAD...origin/$base" 2>/dev/null | head -50
-        fi
-      } > /tmp/gh-aw/agent/base-state.txt
-      if [ "$CONCLUSION" = "failure" ] && [ -n "$RUN_ID" ]; then
-        gh run view "$RUN_ID" --repo "$REPO" --log-failed \
-          > /tmp/gh-aw/agent/failed-logs.txt 2>/dev/null || \
-          echo "logs unavailable" > /tmp/gh-aw/agent/failed-logs.txt
-        gh run view "$RUN_ID" --repo "$REPO" --json jobs \
-          --jq '[.jobs[] | select(.conclusion == "failure") | {name, conclusion}]' \
-          > /tmp/gh-aw/agent/failed-jobs.json
-      elif [ "$CONCLUSION" = "failure" ]; then
-        echo "[]" > /tmp/gh-aw/agent/failed-jobs.json
-        echo "CI run ID unavailable, cannot fetch logs" > /tmp/gh-aw/agent/failed-logs.txt
-      fi
-
+# Each run's OpenTelemetry GenAI spans -- duration, tokens, model, outcome; never prompt or
+# response content -- go to the profile's OTLP endpoint (feature 007 X14, FR-074).
 safe-outputs:
   # Path B. Without this, gh-aw's own safe_outputs job writes as well as the conclude job, and
   # it runs first: it pushed a flattened, single-parent commit with GITHUB_TOKEN while conclude
@@ -1037,15 +997,16 @@ safe-outputs:
 timeout-minutes: 60
 ---
 
-1. You are gating pull request **#${{ needs.subject.outputs.pr }}**, which ${{ needs.subject.outputs.subject_clause }}
-   **#${{ needs.subject.outputs.issue }}**. CI concluded
-   **${{ needs.subject.outputs.conclusion }}**.
+1. You are gating pull request **#${{ needs.subject.outputs.pr }}**, which ${{ needs.subject.outputs.subject_clause }}.
+   CI concluded **${{ needs.subject.outputs.conclusion }}**.
+
+   ${{ needs.subject.outputs.advise_note }}
+
+   ${{ needs.subject.outputs.mode_note }}
 
    ${{ needs.subject.outputs.promotion_note }}
 
-   It has already been confirmed that this is an open pull request we authored, that it closes
-   an issue, and that the issue carries `implement`. Do not re-check any of that, and do not
-   poll for checks: the conclusion above is the answer.
+   ${{ needs.subject.outputs.checked_note }}
 
    **You are on the head branch, not on the merge of the head and its base.** CI ran on the
    merge of the two, which is also what will land. Read `/tmp/gh-aw/agent/base-state.txt`: it
@@ -1143,6 +1104,13 @@ timeout-minutes: 60
    removed assertions, skipped tests, lowered coverage bars, or deleted test files. Read the
    pull request's `## Verification` section too: a `Not tested:` line naming the behaviour this
    change exists for, or no section at all, is a ⚠️ to cite, not a pass.
+   One exception, because no run of this loop can close it: a `Not tested:` line that names only
+   a live run against an outside service -- the forge's own API, a third-party service -- that
+   the agent's sandbox has no credentials or network for. That is ✅ with the note "live run
+   outside the sandbox" when this diff's own tests exercise the behaviour against a stand-in
+   (a mocked client, a recorded response, a fake `gh`), and you have read those tests. It stays
+   ⚠️ when nothing in the diff exercises the behaviour, when the line also names something the
+   agent could have run, or when the issue's acceptance criteria ask for a live run.
 
    **Check 5 — CI/CD & Workflow files.** Does the diff change CI, CD, or workflow files?
    Flag changes to `.github/workflows/`, Dockerfiles, deployment scripts, or infrastructure
@@ -1284,6 +1252,9 @@ flowchart TD
     gateStart("Work Router<br/>merge-gate route<br/>(CI completed)") --> gateSubject
     gateSubject["Subject (rung 4)<br/>Our PR? Closes an implement issue?"] -->|✓| gateFacts
     gateSubject -.->|✗| gateIdle
+    gateSubject -->|person's PR, shadow on| gateAdviseFacts
+    gateAdviseFacts("Advise only<br/>Assess, change nothing") --> gateAdvise
+    gateAdvise(("Advice<br/>one advisory comment on the PR"))
     gateFacts("Facts (rung 3)<br/>Diff, PR shape, failing logs") --> gateCi
     gateCi["CI<br/>What did it conclude?"] -->|success| gateProtected
     gateProtected{"Protected files?"}
@@ -1298,6 +1269,8 @@ flowchart TD
     gateTrivial -->|yes| gateMerge
     gateTrivial -->|no| gateAssess
     gateCi -.->|failure| gateFix
+    gateCi -.->|failure or conflict, review mode| gateRequest
+    gateRequest(("Change request<br/>ranked findings to apply-review, review again on CI"))
     gateCi -.->|no verdict| gateHuman
     gateAssess["Assessment (10 checks)<br/>CI, Auth, API, Tests, CI/CD<br/>Protected, Scope, Risk, Merge, Confidence"] -->|all ✅| gateMerge
     gateAssess -.->|any ⚠️/❌| gateHuman
@@ -1315,9 +1288,9 @@ flowchart TD
     classDef failure fill:#fff0f0,stroke:#ef2929,stroke-width:2px,color:#8b1a2a
     classDef success fill:#e8f8ec,stroke:#18883c,stroke-width:2px,color:#145a32
     class gateStart start
-    class gateFacts,gateFix,gateRebase action
+    class gateFacts,gateFix,gateRebase,gateAdviseFacts action
     class gateSubject,gateCi,gateAssess,gateTrivial,gateConflict,gateProtected decision
     class gateIdle,gateWait idle
     class gateHuman failure
-    class gateMerge success
+    class gateMerge,gateAdvise,gateRequest success
 ```

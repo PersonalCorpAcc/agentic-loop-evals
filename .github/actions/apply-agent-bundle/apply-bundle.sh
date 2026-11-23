@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/apply-agent-bundle/apply-bundle.sh. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/apply-agent-bundle/apply-bundle.sh. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 set -euo pipefail
 
 BUNDLE_FILE=$1

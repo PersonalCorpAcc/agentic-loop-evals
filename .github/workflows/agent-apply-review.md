@@ -1,5 +1,5 @@
 ---
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-apply-review.md. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/workflows/agent-apply-review.md. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 env:
   # Printed by the prompt as the verification block. Consumers set their own commands.
   VERIFY_COMMANDS: "pnpm install --frozen-lockfile && pnpm run build && pnpm run test"
@@ -11,6 +11,9 @@ env:
   REVIEW_LABEL: review
   PR_PENDING_LABEL: pr-pending
   REVIEW_MARKER: "<!-- agent-apply-review -->"
+  # The merge gate's own change request, under `gate.mode: review`: the one review by a bot this
+  # worker answers (feature 007 X08, FR-024). The gate writes the same marker.
+  GATE_REVIEW_MARKER: "<!-- agent-merge-gate-review -->"
   INCOMPLETE_COMMENT: "Automated review feedback ended without an outcome. The issue remains for a retry."
   ISSUE_CONTEXT_PATH: /tmp/gh-aw/agent/issue-context.json
   GH_AW_ALLOWED_BOTS: "personalcorpacc-agentic-loop[bot],github-actions[bot]"
@@ -30,8 +33,11 @@ name: "Agent: Apply Review"
 # Router-only worker. The Work Router owns triggers, classification, and rung 1-2 checks.
 # This workflow receives the classified inputs and runs rung 3+.
 imports:
+  - github/gh-aw/.github/workflows/shared/opencode.md@v1.3.1
   - shared/platform-defaults.md
+  - shared/opencode-ci.md
   - shared/stack-node-pnpm.md
+
 on:
   workflow_call:
     inputs:
@@ -71,6 +77,7 @@ jobs:
           sparse-checkout: |
             .github/actions/record-outcome
             .github/actions/resolve-pr-issue
+            .github/actions/confirm-review-subject
       - name: Resolve the issue this pull request belongs to
         id: resolve
         uses: ./.github/actions/resolve-pr-issue
@@ -86,70 +93,8 @@ jobs:
           PR: ${{ inputs.pr-number }}
           LINKED_ISSUE: ${{ inputs.linked-issue }}
           RESOLVED_ISSUE: ${{ steps.resolve.outputs.issue }}
-        run: |
-          set -euo pipefail
-
-          none() {
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "$1"
-            exit 0
-          }
-
-          pr=$(gh pr view "$PR" --repo "$REPO" --json number,state,author,title,body)
-          [ "$(printf '%s' "$pr" | jq -r '.state')" = "OPEN" ] || none "PR #$PR is not open"
-
-          # Use GitHub's bot flag because App login formats differ across APIs.
-          author=$(printf '%s' "$pr" | jq -r '.author.login')
-          is_bot=$(printf '%s' "$pr" | jq -r '.author.is_bot')
-          [ "$is_bot" = "true" ] || \
-            none "PR #$PR was authored by $author, a human. Never push to a human's branch."
-
-          # The issue this pull request closes, preferring the router-provided linked issue.
-          if [ -n "$LINKED_ISSUE" ]; then
-            issue="$LINKED_ISSUE"
-          elif [ -n "${RESOLVED_ISSUE:-}" ]; then
-            issue="$RESOLVED_ISSUE"
-          else
-            issue=$(printf '%s' "$pr" | jq -r '.body // ""' \
-                      | grep -oiE '(close[sd]?|fixe?[sd]?|resolve[sd]?) +#[0-9]+' \
-                      | grep -oE '[0-9]+' | head -n 1 || true)
-          fi
-
-          # Unresolved review threads, from the API rather than from the model's reading of it.
-          # The threads themselves are carried, not just how many: the agent's push outdates
-          # every thread it fixes, so this is the only moment the set can be read (T245).
-          threads=$(gh api graphql -f query='
-            query($owner:String!, $name:String!, $number:Int!) {
-              repository(owner:$owner, name:$name) {
-                pullRequest(number:$number) {
-                  reviewThreads(first:100) { nodes { id isResolved isOutdated } }
-                }
-              }
-            }' \
-            -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$PR" \
-            --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-                      | select(.isResolved == false and .isOutdated == false)]' | jq -c .)
-          # gh's jq option takes an expression only: given the compact flag first, gh read the flag as the filter and the
-          # filter as a second endpoint, and failed "accepts 1 arg(s), received 2" on the first
-          # review anyone requested (loopscope PR #158, 20/11/2026).
-          unresolved=$(printf '%s' "$threads" | jq 'length')
-
-          # Measured and then acted on. Two events arrive for one review -- the submission and
-          # each of its comments -- and the `pr-feedback-<pr>` group serialises them, so the
-          # second starts after the first has pushed its fix and outdated the thread it fixed.
-          # Without this it ran a second agent over a pull request with nothing outstanding,
-          # and the outcome line below has always said that is not what happens (T245).
-          [ "$unresolved" -gt 0 ] || \
-            none "PR #$PR has no unresolved review threads; the feedback has already been applied."
-
-          {
-            echo "found=true"
-            echo "pr=$PR"
-            echo "issue=${issue:-}"
-            echo "unresolved=$unresolved"
-            echo "threads=$threads"
-           } >> "$GITHUB_OUTPUT"
-           echo "PR #$PR has $unresolved unresolved thread(s)"
+          GATE_REVIEW_MARKER: ${{ env.GATE_REVIEW_MARKER }}
+        run: bash ./.github/actions/confirm-review-subject/confirm-review-subject.sh
       - name: Record the outcome
         if: always()
         uses: ./.github/actions/record-outcome
@@ -178,6 +123,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Mark the linked issue as in progress
         uses: ./.github/actions/add-issue-labels
         with:
@@ -243,6 +195,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -263,6 +222,16 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           issue-number: ${{ needs.subject.outputs.issue }}
           labels: ${{ env.WORKING_LABEL }}
+      # A standing change request holds the gate until its author looks again, and nothing
+      # told them to: loopscope #329 waited two hours after a correct fix (FR-121).
+      - name: Ask for a re-review
+        if: needs.validate_output.outputs.outcome == 'implemented'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.subject.outputs.pr }}
+        run: bash ./.github/actions/ask-for-re-review/ask-for-re-review.sh
       - name: Flag review outcome
         if: needs.validate_output.outputs.outcome != 'implemented'
         uses: ./.github/actions/add-issue-labels
@@ -287,7 +256,7 @@ jobs:
           subject: ${{ needs.subject.outputs.pr && format('#{0}', needs.subject.outputs.pr) || '-' }}
           detail: "${{ needs.validate_output.outputs.outcome == 'implemented' && 'The review feedback was applied to the pull request branch.' || 'The feedback was not applied; the issue carries the review label and the reason.' }}"
   incomplete:
-    needs: [subject, agent, safe_outputs, validate_output]
+    needs: [activation, subject, agent, safe_outputs, validate_output]
     if: >
       always() &&
       needs.subject.outputs.found == 'true' &&
@@ -307,6 +276,13 @@ jobs:
         with:
           client-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
       - name: Release the issue
         uses: ./.github/actions/remove-issue-labels
         with:
@@ -327,6 +303,7 @@ jobs:
           body: |
             ${{ env.REVIEW_MARKER }}
             ${{ env.INCOMPLETE_COMMENT }}
+            ${{ needs.activation.outputs.daily_ai_credits_exceeded == 'true' && format('The agent did not start: this repository has used its daily AI-credit allowance ({0} of {1}; the `GH_AW_DEFAULT_MAX_DAILY_AI_CREDITS` repository variable sets it). Work resumes once the day''s usage is back under it; raise the variable to allow more.', needs.activation.outputs.daily_ai_credits_total, needs.activation.outputs.daily_ai_credits_threshold) || '' }}
             [View this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 if: needs.subject.outputs.found == 'true'
@@ -335,14 +312,21 @@ runs-on: ubuntu-24.04
 runs-on-slim: ubuntu-24.04
 
 engine:
-  id: claude
+  id: opencode
+  version: "2.0.26"
   # The agent job's own concurrency group, per pull request. The compiler's default is one group per
   # workflow, which serialised this worker across the whole repository whatever the router
   # allowed; the router's caller job owns the real limit (review WF-06).
   concurrency:
     group: "gh-aw-apply-review-${{ inputs.pr-number }}"
     cancel-in-progress: false
-model: claude-sonnet-5
+  env:
+    # The gateway's endpoint, and only where there is a gateway. Under an engine that calls
+    # its own host the whole block goes, this comment with it: a variable naming a gateway
+    # that is not there configures nothing and reads as though it does (FR-076).
+    OPENAI_BASE_URL: https://api.anthropic.com/v1
+
+model: openai/claude-sonnet-5
 
 max-turns: 300
 max-turn-cache-misses: 3000
@@ -360,38 +344,19 @@ steps:
       token: ${{ github.token }}
       issue-number: ${{ needs.subject.outputs.issue }}
       output-path: ${{ env.ISSUE_CONTEXT_PATH }}
+  # Under an engine with a stop hook the session cannot finish while the verify command fails;
+  # it is refused three times at most, then may end, and the gate still checks CI (feature 007
+  # X10, FR-026). The settings file is the engine's; the hook is a managed script.
   - name: Fetch the whole review conversation and the diff
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR: ${{ inputs.pr-number }}
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent
-      gh pr diff "$PR" --repo "$REPO" > /tmp/gh-aw/agent/diff.patch
-      gh api "repos/$REPO/pulls/$PR/comments" --paginate \
-        --jq '[.[] | {id, path, line, author: .user.login, body, in_reply_to_id}]' \
-        > /tmp/gh-aw/agent/review-comments.json
-      gh api "repos/$REPO/issues/$PR/comments" --paginate \
-        --jq '[.[] | {author: .user.login, body}]' \
-        > /tmp/gh-aw/agent/conversation.json
-      gh api graphql -f query='
-        query($owner:String!, $name:String!, $number:Int!) {
-          repository(owner:$owner, name:$name) {
-            pullRequest(number:$number) {
-                  reviewThreads(first:100) {
-                  nodes { id
-                  isResolved isOutdated path
-                  comments(first:50) { nodes { author { login } body } }
-                }
-              }
-            }
-          }
-        }' \
-        -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$PR" \
-        --jq '.data.repository.pullRequest.reviewThreads.nodes' \
-        > /tmp/gh-aw/agent/review-threads.json
+      THREADS: ${{ needs.subject.outputs.threads }}
+    run: bash ./.github/actions/fetch-review-context/fetch-review-context.sh
 
+# Each run's OpenTelemetry GenAI spans -- duration, tokens, model, outcome; never prompt or
+# response content -- go to the profile's OTLP endpoint (feature 007 X14, FR-074).
 safe-outputs:
   # A failed run is already a red run. An issue per failure buries the real backlog
   # under noise nobody closes.
@@ -414,6 +379,13 @@ safe-outputs:
     # so it can only warn, and a warning on every run trains people to ignore
     # the log. Protection is enforced by the forge at push time regardless.
     check-branch-protection: false
+    # gh-aw diffs the push against the old pull request head, so merging the target branch in
+    # to resolve a conflict reads as the agent editing every protected file the target has
+    # changed since: PR #319 (loopscope, 22/11/2026) was refused for README.md, package.json
+    # and pnpm-lock.yaml that were already on dev, and ended without an outcome. The rule that
+    # matters is the merge gate's protected_changes job, which compares the pull request with
+    # its base as it is now and hands any protected file to a person. As in the gate (FR-120).
+    protected-files: allowed
   add-comment:
     target: "*"
 
@@ -423,7 +395,8 @@ timeout-minutes: 45
 
 1. You are applying review feedback to pull request
    **#${{ needs.subject.outputs.pr }}**, which has
-   **${{ needs.subject.outputs.unresolved }}** unresolved review thread(s).
+   **${{ needs.subject.outputs.unresolved }}** unresolved item(s): review threads, and at most
+   one change request written as a review body.
 
    It has already been confirmed that this pull request is open, that we authored it, and that
    the reviewer has write access. Do not re-check any of that.
@@ -435,6 +408,8 @@ timeout-minutes: 45
 3. Read the whole conversation, not just the comment that triggered you. It is already on disk:
 
    - `/tmp/gh-aw/agent/review-threads.json` , every thread with its resolved and outdated state
+   - `/tmp/gh-aw/agent/change-requests.json` , a change request written as a review body, with
+     no thread of its own; empty when there is none
    - `/tmp/gh-aw/agent/review-comments.json` , every inline comment with its file and line
    - `/tmp/gh-aw/agent/conversation.json` , every conversation comment
    - `/tmp/gh-aw/agent/diff.patch` , the current diff
@@ -444,8 +419,14 @@ timeout-minutes: 45
 
 4. Work out which items are genuinely actionable and still outstanding. Skip anything already
    addressed by a later commit, anything a bot wrote, anything from the pull request author,
-   and anything that is a question rather than a request. You must account for every unresolved
-   human review thread by its `PRRT_...` ID. Do not claim feedback was implemented when no branch
+   and anything that is a question rather than a request. One bot's request is not skipped: the
+   merge gate's change request, whose body starts with `${{ env.GATE_REVIEW_MARKER }}`. Answer it
+   as you would a person's: address every `[blocker]` and `[major]` finding it lists, and a
+   `[minor]` one only where it is trivial and safe. Where it says the branch conflicts with its
+   base, merge the base branch it names into this branch and resolve every conflict; never
+   rebase, because the push is fast-forward only. You must account for every unresolved
+   human review thread by its `PRRT_...` ID, and for the change request in
+   `change-requests.json`, if there is one, by its `PRR_...` ID. Do not claim feedback was implemented when no branch
    change is needed: that requires reviewer confirmation.
 
  5. Load only skills required by the feedback, then apply it. Make only changes the feedback
@@ -485,7 +466,8 @@ timeout-minutes: 45
    - **needs-human**: The feedback is ambiguous, unsafe, or cannot be applied. Do not push.
 
 9. Emit exactly one `add_comment` on PR `${{ needs.subject.outputs.pr }}`. Include every
-   unresolved human review thread ID and an explanation for it, then exactly one line:
+   unresolved human review thread ID, and the change request's `PRR_...` ID if there is one,
+   with an explanation for each, then exactly one line:
    `**Review outcome:** implemented`, `**Review outcome:** already-satisfied`, or
    `**Review outcome:** needs-human`.
 

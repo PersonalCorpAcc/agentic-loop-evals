@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/resolve-pr-issue/resolve-pr-issue.sh. Profile digest: 6d57505525cb. Update with `workflows update --force`; consumer edits may be overwritten.
+# Managed by @software-factory-dev/cli@0.5.1. Source: loops/actions/resolve-pr-issue/resolve-pr-issue.sh. Profile digest: a3bef47bda90. Update with `workflows update --force`; consumer edits may be overwritten.
 #
 # Which issue does this pull request belong to? (FR-030)
 #
@@ -20,6 +20,19 @@
 # Environment: GH_TOKEN, and REPO or GITHUB_REPOSITORY.
 
 # shellcheck shell=bash
+
+# The issue numbers of every marker in a body on stdin, in order, counting only a marker that
+# stands on a line of its own outside a fenced code block, which is the only way the App writes
+# one. A marker quoted in prose is not a link: loopscope PR #329 (for #318) described its
+# regression test as "carrying `<!-- implement-issue: 207 -->`", and the gate took #207, found it
+# was not labelled implement, and never assessed the pull request (22/11/2026).
+marker_issues() {
+  tr -d '\r' | awk '
+    /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+    !fenced && /^[[:space:]]*<!-- implement-issue: [0-9]+ -->[[:space:]]*$/ {
+      match($0, /[0-9]+/); print substr($0, RSTART, RLENGTH)
+    }'
+}
 
 # Every issue this pull request belongs to, one per line, oldest marker first and each one
 # once.
@@ -48,9 +61,7 @@ pr_issues() {
   # `awk '!seen[$0]++'` rather than `sort -u`: the order markers were written in is the
   # order the changes were carried in, and a set that reorders them would report the
   # promotion's contents in an order nobody can check against the log.
-  markers="$(printf '%s' "$body" |
-    grep -oE '<!-- implement-issue: [0-9]+ -->' |
-    grep -oE '[0-9]+' | awk '!seen[$0]++' || true)"
+  markers="$(printf '%s\n' "$body" | marker_issues | awk '!seen[$0]++' || true)"
   if [ -n "$markers" ]; then
     printf '%s\n' "$markers"
     return 0
@@ -80,7 +91,7 @@ pr_issue() {
   # The marker first. It is written by the App after the pull request exists, because the
   # framework strips every HTML comment from what the agent produces.
   body="$(printf '%s' "$pr_json" | jq -r '.body // ""')"
-  issue="$(printf '%s' "$body" | grep -oE '<!-- implement-issue: [0-9]+ -->' | grep -oE '[0-9]+' | head -n1 || true)"
+  issue="$(printf '%s\n' "$body" | marker_issues | head -n1 || true)"
   if [ -n "$issue" ]; then
     printf '%s' "$issue"
     return 0
