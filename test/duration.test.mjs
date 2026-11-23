@@ -18,6 +18,24 @@ test("refuses anything else", () => {
   assert.equal(parse("1x"), null);
 });
 
+test("accepts upper-case units with the same value as lower-case", () => {
+  assert.equal(parse("2H"), parse("2h"));
+  assert.equal(parse("30S"), parse("30s"));
+  assert.equal(parse("5M"), parse("5m"));
+  assert.equal(parse("1D"), parse("1d"));
+  assert.equal(parse("2W"), parse("2w"));
+});
+
+test("still refuses spaces, unknown units and zero regardless of case", () => {
+  assert.equal(parse("0M"), null);
+  assert.equal(parse("5 M"), null);
+  assert.equal(parse("1X"), null);
+});
+
+test("format always writes lower case even for upper-case input", () => {
+  assert.equal(format(parse("2H")), "2h");
+});
+
 test("formats in the largest unit that divides exactly", () => {
   assert.equal(format(300_000), "5m");
   assert.equal(format(90_000), "90s");
