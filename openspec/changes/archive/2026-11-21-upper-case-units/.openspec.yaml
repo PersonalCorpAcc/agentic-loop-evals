@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-21
+goal: parse() accepts upper-case unit letters with the same values as
+  lower-case; format() still emits lower-case
+skip_specs: true
