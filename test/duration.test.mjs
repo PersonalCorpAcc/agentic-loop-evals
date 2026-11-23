@@ -18,6 +18,19 @@ test("refuses anything else", () => {
   assert.equal(parse("1x"), null);
 });
 
+test("accepts compound durations, largest unit first", () => {
+  assert.equal(parse("1h30m"), 5_400_000);
+  assert.equal(parse("2d4h"), 187_200_000);
+  assert.equal(parse("1w2d3h4m5s"), 788_645_000);
+});
+
+test("refuses a repeated or out-of-order unit", () => {
+  assert.equal(parse("30m1h"), null);
+  assert.equal(parse("1h1h"), null);
+  assert.equal(parse("1h 30m"), null);
+  assert.equal(parse("1h30x"), null);
+});
+
 test("formats in the largest unit that divides exactly", () => {
   assert.equal(format(300_000), "5m");
   assert.equal(format(90_000), "90s");
