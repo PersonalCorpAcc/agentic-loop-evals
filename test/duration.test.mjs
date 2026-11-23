@@ -14,6 +14,7 @@ test("parses each unit", () => {
 test("refuses anything else", () => {
   assert.equal(parse("5"), null);
   assert.equal(parse("0m"), null);
+  assert.equal(parse("0s"), null);
   assert.equal(parse("5 m"), null);
   assert.equal(parse("1x"), null);
 });
@@ -23,6 +24,16 @@ test("formats in the largest unit that divides exactly", () => {
   assert.equal(format(90_000), "90s");
   assert.equal(format(86_400_000), "1d");
   assert.equal(format(1_209_600_000), "2w");
+});
+
+test("formats zero as 0s", () => {
+  assert.equal(format(0), "0s");
+});
+
+test("refuses negative, fractional, and non-number durations", () => {
+  assert.throws(() => format(-1));
+  assert.throws(() => format(1.5));
+  assert.throws(() => format("5m"));
 });
 
 test("prefers weeks over days when a value divides exactly", () => {
